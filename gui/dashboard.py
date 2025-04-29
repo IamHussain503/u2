@@ -185,6 +185,14 @@ class Dashboard(QWidget):
 
     def _exit_position(self, pos_type, exit_price, profit, reason=""):
         # Update capital
+
+        symbol = self.symbol_selector.currentText()
+        size = abs(exit_size)  # Get size from risk manager or stored value
+
+        if pos_type == "long":
+            self.connector.create_market_exit_order(symbol, size, side='sell')
+        else:
+            self.connector.create_market_exit_order(symbol, size, side='buy')
         self.capital += profit
 
         # Log output
