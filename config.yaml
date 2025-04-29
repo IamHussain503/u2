@@ -1,0 +1,8 @@
+symbol: BTC/USDT
+timeframe: 1h
+leverage: 20
+risk_per_trade: 0.01
+initial_capital: 10
+paper_mode: false
+font_size: 14
+trade_log_file: data/trades.csv

@@ -1,0 +1,13 @@
+PyQt6
+ccxt
+pandas
+numpy
+ta
+python-dotenv
+matplotlib
+xgboost
+scikit-learn
+fpdf2
+pyinstaller
+vectorbt
+tensorflow
