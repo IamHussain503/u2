@@ -1,51 +1,77 @@
 import os
 import time
+import threading
+import yaml
+import pandas as pd
+import ta
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QComboBox
 from exchange.binance_connector import BinanceFuturesConnector
 from strategies.strategy_manager import StrategyManager
 from risk.risk_manager import RiskManager
-import pandas as pd
-import ta
-import threading
-import yaml
 
 # Optional alerting
 try:
     from utils.helpers import send_telegram_message
 except ImportError:
     def send_telegram_message(msg):
-        print("[TELEGRAM DISABLED] Missing API keys:", msg)
+        print("[TELEGRAM DISABLED]", msg)
+
 
 class Dashboard(QWidget):
     def __init__(self, log_callback=None):
         super().__init__()
         self.log_callback = log_callback
+
+        # connectors & managers
         self.connector = BinanceFuturesConnector()
         self.risk_manager = RiskManager()
 
-        # Load configuration
-        self.config_path = "config.yaml"
-        if not os.path.exists(self.config_path):
-            raise FileNotFoundError(f"Missing {self.config_path}")
-            
-        with open(self.config_path, 'r') as f:
+        # load config
+        cfg_path = "config.yaml"
+        if not os.path.exists(cfg_path):
+            raise FileNotFoundError(f"Missing config file: {cfg_path}")
+        with open(cfg_path, "r") as f:
             self.config = yaml.safe_load(f)
-        
-        # Initialize capital based on paper/live mode
-        self.capital = self.config.get("initial_capital", 10000)
-        self.in_position = False
-        self.position_type = None
-        self.entry_price = None
 
+        # basic settings
+        self.symbol         = self.config["symbol"]
+        self.timeframe      = self.config["timeframe"]
+        self.limit          = int(self.config.get("limit", 100))
+        self.poll_interval  = int(self.config.get("poll_interval", 60))
+        self.initial_capital= float(self.config.get("initial_capital", 10000))
+        self.capital        = self.initial_capital
+        self.paper_mode     = bool(self.config.get("paper_mode", True))
+        self.trade_log_file = self.config.get("trade_log_file", "data/trades.csv")
+
+        # risk settings
+        self.leverage       = int(self.config.get("leverage", 1))
+        self.risk_per_trade = float(self.config.get("risk_per_trade", 0.01))
+
+        # ATR & TP/SL settings
+        self.atr_window     = int(self.config.get("atr_window", 14))
+        self.atr_mult       = float(self.config.get("atr_multiplier", 1.5))
+        self.tp_mult        = float(self.config.get("tp_multiplier", 3.0))
+
+        # fee settings
+        self.fee_rate       = float(self.config.get("taker_fee", 0.0004))
+
+        # in-trade state
+        self.in_position    = False
+        self.position_type  = None
+        self.entry_price    = None
+        self.position_size  = None
+        self.initial_atr    = None
+        self.tp_price       = None
+        self.ult_sl_price   = None
+        self.highest_price  = None
+        self.lowest_price   = None
+
+        # build UI
         layout = QVBoxLayout()
-
-        # GUI Elements
         self.symbol_input = QComboBox()
-        self.symbol_input.addItems(["BTC/USDT", "ETH/USDT"])
-        
+        self.symbol_input.addItem(self.symbol)
         self.strategy_selector = QComboBox()
-        self.strategy_selector.addItems(["EMA Crossover", "RSI Divergence", "Bollinger Breakout"])
-
+        self.strategy_selector.addItems(list(StrategyManager().strategy_map.keys()))
         self.run_button = QPushButton("Run Live Bot")
         self.run_button.clicked.connect(self.start_live_trading)
 
@@ -57,11 +83,14 @@ class Dashboard(QWidget):
         self.setLayout(layout)
 
     def start_live_trading(self):
-        """Start live trading in background thread"""
         symbol = self.symbol_input.currentText()
         strategy_name = self.strategy_selector.currentText()
         self.log(f"[INFO] Starting bot for {symbol} using '{strategy_name}' strategy...")
-        threading.Thread(target=self._live_trading_loop, args=(symbol, strategy_name), daemon=True).start()
+        threading.Thread(
+            target=self._live_trading_loop,
+            args=(symbol, strategy_name),
+            daemon=True
+        ).start()
 
     def _live_trading_loop(self, symbol, strategy_name):
         try:
@@ -70,171 +99,210 @@ class Dashboard(QWidget):
                 raise ValueError(f"Strategy '{strategy_name}' could not be loaded.")
 
             while True:
-                df = self.connector.fetch_ohlcv(symbol=symbol, timeframe=self.config['timeframe'], limit=100)
-
-                # Apply selected strategy
+                # fetch latest candles
+                df = self.connector.fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=self.timeframe,
+                    limit=self.limit
+                )
                 signal_df = strategy.generate_signal(df.copy())
+                latest     = signal_df.iloc[-1]
 
-                # Ensure 'signal' column exists
-                if 'signal' not in signal_df.columns:
-                    self.log("[ERROR] Strategy did not return valid signals.")
-                    time.sleep(60)
-                    continue
+                # basic signals
+                signal      = int(latest.get("signal", 0))
+                exit_signal = int(latest.get("exit_signal", 0))
+                close_price = float(latest["close"])
 
-                latest = signal_df.iloc[-1]
-                close_price = latest['close']
+                # compute ATR
+                signal_df["atr"] = ta.volatility.average_true_range(
+                    signal_df["high"],
+                    signal_df["low"],
+                    signal_df["close"],
+                    window=self.atr_window
+                )
+                atr_value = float(signal_df["atr"].dropna().iloc[-1])
 
-                # Calculate ATR for stop-loss
-                signal_df['atr'] = ta.volatility.average_true_range(signal_df['high'], signal_df['low'], signal_df['close'], window=14)
-                atr_value = float(signal_df['atr'].dropna().iloc[-1])
-                stop_loss_distance = atr_value * 1.5
-
-                # Get balance and calculate size
-                balance = self.get_account_balance()
-                size = self.risk_manager.calculate_position_size(
-                    balance,
-                    close_price,
-                    stop_loss_distance,
-                    leverage=int(self.config.get('leverage', 10)),
-                    risk_percent=float(self.config.get('risk_per_trade', 0.01))
+                # calculate position size
+                balance            = self.get_account_balance()
+                stop_loss_distance = atr_value * self.atr_mult
+                self.position_size = self.risk_manager.calculate_position_size(
+                    balance=balance,
+                    price=close_price,
+                    stop_loss=stop_loss_distance,
+                    leverage=self.leverage,
+                    risk_percent=self.risk_per_trade
                 )
 
-                # Extract signal safely
-                signal = int(latest['signal'])
+                self.log(f"[DEBUG] Signal={signal}, ExitSignal={exit_signal}")
 
-                # --- Long Entry ---
+                # 1) strategy-based exit
+                if self.in_position and exit_signal != 0:
+                    reason = "Strategy Exit"
+                    if exit_signal == 1 and self.position_type == "long":
+                        self.log(f"[DEBUG] Strategy exit LONG @ {close_price:.5f}")
+                        self._exit_position("long", close_price, reason)
+                    elif exit_signal == -1 and self.position_type == "short":
+                        self.log(f"[DEBUG] Strategy exit SHORT @ {close_price:.5f}")
+                        self._exit_position("short", close_price, reason)
+                    time.sleep(self.poll_interval)
+                    continue
+
+                # 2) new entry
                 if not self.in_position and signal == 1:
-                    self.place_long_order(symbol, size)
-                    message = f"[LONG] Opening position at ${close_price:.2f}"
-                    self.log(message)
-                    self.send_alert(message)
-
-                    self.in_position = True
-                    self.position_type = 'long'
+                    self.place_long_order(symbol, self.position_size)
                     self.entry_price = close_price
+                    # lock in SL/TP
+                    self.initial_atr   = atr_value
+                    self.tp_price      = self.entry_price + (atr_value * self.tp_mult)
+                    self.ult_sl_price  = self.entry_price - (atr_value * self.tp_mult)
+                    self.highest_price = self.entry_price
+                    self.position_type = "long"
+                    self.in_position   = True
+                    self.log(f"[LONG] Opened @ {self.entry_price:.5f} | Size={self.position_size:.5f}")
 
-                # --- Short Entry ---
                 elif not self.in_position and signal == -1:
-                    self.place_short_order(symbol, size)
-                    message = f"[SHORT] Opening position at ${close_price:.2f}"
-                    self.log(message)
-                    self.send_alert(message)
-
-                    self.in_position = True
-                    self.position_type = 'short'
+                    self.place_short_order(symbol, self.position_size)
                     self.entry_price = close_price
+                    # lock in SL/TP
+                    self.initial_atr   = atr_value
+                    self.tp_price      = self.entry_price - (atr_value * self.tp_mult)
+                    self.ult_sl_price  = self.entry_price + (atr_value * self.tp_mult)
+                    self.lowest_price  = self.entry_price
+                    self.position_type = "short"
+                    self.in_position   = True
+                    self.log(f"[SHORT] Opened @ {self.entry_price:.5f} | Size={self.position_size:.5f}")
 
-                # --- Exit Conditions (Long) ---
-                elif self.in_position and self.position_type == 'long':
-                    trailing_sl = close_price - atr_value
-                    take_profit = self.entry_price + (atr_value * 3)
-                    ultimate_sl = self.entry_price - (atr_value * 3)
+                # 3) ATR + trailing exits
+                if self.in_position:
+                    if self.position_type == "long":
+                        # update trailing
+                        self.highest_price = max(self.highest_price, close_price)
+                        trailing_price = self.highest_price - (self.initial_atr * self.atr_mult)
+                        self.log(
+                            f"[DEBUG] Price={close_price:.5f} "
+                            f"ULT_SL={self.ult_sl_price:.5f} "
+                            f"TP={self.tp_price:.5f} "
+                            f"TR_SL={trailing_price:.5f}"
+                        )
+                        if close_price <= self.ult_sl_price:
+                            self._exit_position("long", close_price, "Ultimate SL")
+                        elif close_price >= self.tp_price:
+                            self._exit_position("long", close_price, "Take Profit")
+                        elif close_price <= trailing_price:
+                            self._exit_position("long", close_price, "Trailing SL")
 
-                    if close_price <= ultimate_sl:
-                        profit = close_price - self.entry_price
-                        self._exit_position('long', close_price, profit, reason='Ultimate SL')
-                    elif close_price >= take_profit:
-                        profit = close_price - self.entry_price
-                        self._exit_position('long', close_price, profit, reason='Take Profit')
-                    elif close_price <= trailing_sl:
-                        profit = close_price - self.entry_price
-                        self._exit_position('long', close_price, profit, reason='Trailing SL')
+                    else:  # short
+                        self.lowest_price = min(self.lowest_price, close_price)
+                        trailing_price = self.lowest_price + (self.initial_atr * self.atr_mult)
+                        self.log(
+                            f"[DEBUG] Price={close_price:.5f} "
+                            f"ULT_SL={self.ult_sl_price:.5f} "
+                            f"TP={self.tp_price:.5f} "
+                            f"TR_SL={trailing_price:.5f}"
+                        )
+                        if close_price >= self.ult_sl_price:
+                            self._exit_position("short", close_price, "Ultimate SL")
+                        elif close_price <= self.tp_price:
+                            self._exit_position("short", close_price, "Take Profit")
+                        elif close_price >= trailing_price:
+                            self._exit_position("short", close_price, "Trailing SL")
 
-                # --- Exit Conditions (Short) ---
-                elif self.in_position and self.position_type == 'short':
-                    trailing_sl = close_price + atr_value
-                    take_profit = self.entry_price - (atr_value * 3)
-                    ultimate_sl = self.entry_price + (atr_value * 3)
-
-                    if close_price >= ultimate_sl:
-                        profit = self.entry_price - close_price
-                        self._exit_position('short', close_price, profit, reason='Ultimate SL')
-                    elif close_price <= take_profit:
-                        profit = self.entry_price - close_price
-                        self._exit_position('short', close_price, profit, reason='Take Profit')
-                    elif close_price >= trailing_sl:
-                        profit = self.entry_price - close_price
-                        self._exit_position('short', close_price, profit, reason='Trailing SL')
-
-                time.sleep(60)  # Re-check every minute
+                time.sleep(self.poll_interval)
 
         except Exception as e:
-            self.log(f"[ERROR] Live trading failed: {e}")
+            self.log(f"[ERROR] Live trading loop failed: {e}")
 
     def place_long_order(self, symbol, size):
-        if self.config.get('paper_mode', True):
-            self.log(f"[PAPER] Placed LONG order: {size:.6f} contracts at {symbol}")
+        if self.paper_mode:
+            self.log(f"[PAPER] LONG @{symbol}, size {size:.5f}")
         else:
-            # Real trading logic here
             self.connector.exchange.create_market_buy_order(symbol, size)
-            self.log(f"[LIVE] Long order placed: {size:.6f} on {symbol}")
+            self.log(f"[LIVE] LONG @{symbol}, size {size:.5f}")
 
     def place_short_order(self, symbol, size):
-        if self.config.get('paper_mode', True):
-            self.log(f"[PAPER] Placed SHORT order: {size:.6f} contracts at {symbol}")
+        if self.paper_mode:
+            self.log(f"[PAPER] SHORT @{symbol}, size {size:.5f}")
         else:
-            params = {'positionSide': 'SHORT'}
-            self.connector.exchange.create_market_sell_order(symbol, size, params=params)
-            self.log(f"[LIVE] Short order placed: {size:.6f} on {symbol}")
+            self.connector.exchange.create_market_sell_order(symbol, size)
+            self.log(f"[LIVE] SHORT @{symbol}, size {size:.5f}")
 
     def get_account_balance(self):
-        if self.config.get('paper_mode'):
+        if self.paper_mode:
             return self.capital
-        else:
-            return float(self.connector.exchange.fetch_balance()['total']['USDT'])
+        bal = self.connector.exchange.fetch_balance()["total"]["USDT"]
+        return float(bal)
 
-    def _exit_position(self, pos_type, exit_price, profit, reason=""):
-        # Update capital
-
-        symbol = self.symbol_selector.currentText()
-        size = abs(exit_size)  # Get size from risk manager or stored value
-
+    def _exit_position(self, pos_type, exit_price, reason=""):
+        size = self.position_size
+        # gross P&L
         if pos_type == "long":
-            self.connector.create_market_exit_order(symbol, size, side='sell')
+            gross = (exit_price - self.entry_price) * size
         else:
-            self.connector.create_market_exit_order(symbol, size, side='buy')
-        self.capital += profit
+            gross = (self.entry_price - exit_price) * size
+        # fees
+        fees = (self.entry_price + exit_price) * size * self.fee_rate
+        net  = gross - fees
 
-        # Log output
-        message = f"[CLOSE] {pos_type.upper()} exited at ${exit_price:.2f} | Reason: {reason}, Profit: ${profit:.2f}, Capital: ${self.capital:.2f}"
-        self.log(message)
-        self.send_alert(message)
+        # execute the close
+        if not self.paper_mode:
+            sym = self.symbol_input.currentText()
+            if pos_type == "long":
+                self.connector.exchange.create_market_sell_order(sym, size)
+            else:
+                self.connector.exchange.create_market_buy_order(sym, size)
 
-        # Save to CSV
+        # update capital
+        self.capital += net
+
+        # log & alert
+        self.log(
+            f"[CLOSE] {pos_type.upper()} @ {exit_price:.5f} | "
+            f"Gross={gross:.5f} Fees={fees:.5f} Net={net:.5f} "
+            f"Capital={self.capital:.5f} Reason={reason}"
+        )
+        self.send_alert(
+            f"[CLOSE] {pos_type.upper()} @ {exit_price:.5f} | Net={net:.5f} Reason={reason}"
+        )
+
+        # record
         self.save_trade_to_csv({
-            'timestamp': pd.Timestamp.now(),
-            'entry_price': self.entry_price,
-            'exit_price': exit_price,
-            'type': pos_type,
-            'profit': profit,
-            'reason': reason
+            "timestamp":    pd.Timestamp.now(),
+            "entry_price":  self.entry_price,
+            "exit_price":   exit_price,
+            "type":         pos_type,
+            "profit":       net,
+            "reason":       reason
         })
 
-        # Reset flags
-        self.in_position = False
+        # reset
+        self.in_position   = False
         self.position_type = None
-        self.entry_price = None
+        self.entry_price   = None
+        self.position_size = None
+        self.initial_atr   = None
+        self.tp_price      = None
+        self.ult_sl_price  = None
+        self.highest_price = None
+        self.lowest_price  = None
 
     def save_trade_to_csv(self, data):
         import csv
-        file_path = self.config.get('trade_log_file', 'data/trades.csv')
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-        fieldnames = ['timestamp', 'entry_price', 'exit_price', 'type', 'profit', 'reason']
-        write_header = not os.path.exists(file_path)
-
-        with open(file_path, 'a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+        os.makedirs(os.path.dirname(self.trade_log_file), exist_ok=True)
+        write_header = not os.path.exists(self.trade_log_file)
+        with open(self.trade_log_file, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(data.keys()))
             if write_header:
                 writer.writeheader()
             writer.writerow(data)
 
     def log(self, msg):
         if self.log_callback:
-            self.log_callback(f"{msg}")
+            self.log_callback(msg)
+        else:
+            print(msg)
 
     def send_alert(self, msg):
-        if os.getenv("TELEGRAM_BOT_TOKEN") and not self.config.get('paper_mode'):
+        if os.getenv("TELEGRAM_BOT_TOKEN") and not self.paper_mode:
             try:
                 send_telegram_message(msg)
             except Exception as e:

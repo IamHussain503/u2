@@ -32,7 +32,7 @@ class BinanceFuturesConnector:
         except Exception as e:
             print("[ERROR] Could not fetch server time:", e)
 
-    def fetch_ohlcv(self, symbol="BTC/USDT", timeframe="1h", limit=100):
+    def fetch_ohlcv(self, symbol="PIXEL/USDT", timeframe="5m", limit=100):
         ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')

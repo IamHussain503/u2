@@ -1,20 +1,22 @@
 # gui/backtest_view.py
+
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QTextEdit, QLabel, QComboBox
 from exchange.binance_connector import BinanceFuturesConnector
 from strategies.strategy_manager import StrategyManager
 from backtester.backtester import Backtester
 from utils.performance_analyzer import PerformanceAnalyzer
 import threading
+import pandas as pd
 
 class BacktestView(QWidget):
     def __init__(self):
         super().__init__()
         self.layout = QVBoxLayout()
-        self.select_label = QLabel("Select Strategy:")
+        self.select_label      = QLabel("Select Strategy:")
         self.strategy_selector = QComboBox()
         self.strategy_selector.addItems(["EMA Crossover", "RSI Divergence", "Bollinger Breakout"])
-        self.backtest_button = QPushButton("Run Strategy Backtest")
-        self.output = QTextEdit()
+        self.backtest_button   = QPushButton("Run Strategy Backtest")
+        self.output            = QTextEdit()
         self.output.setReadOnly(True)
 
         self.layout.addWidget(self.select_label)
@@ -23,40 +25,46 @@ class BacktestView(QWidget):
         self.layout.addWidget(self.output)
         self.setLayout(self.layout)
 
-        # Event binding
         self.backtest_button.clicked.connect(self.run_backtest)
 
     def run_backtest(self):
-        strategy_name = self.strategy_selector.currentText()
-        self.output.append(f"[INFO] Running backtest for: {strategy_name}\n")
+        self.backtest_button.setEnabled(False)
+        strat = self.strategy_selector.currentText()
+        self.output.append(f"[INFO] Running backtest for: {strat}\n")
+        threading.Thread(target=self._worker, args=(strat,), daemon=True).start()
 
-        # Run in thread to avoid freezing UI
-        threading.Thread(target=self._run_in_thread, args=(strategy_name,), daemon=True).start()
-
-    def _run_in_thread(self, strategy_name):
+    def _worker(self, strategy_name):
         try:
-            connector = BinanceFuturesConnector()
-            df = connector.fetch_ohlcv(symbol="BTC/USDT", timeframe="1h", limit=200)
-            strategy_manager = StrategyManager()
-            strategy = strategy_manager.get_strategy(strategy_name)
+            # 1) fetch data (spot or futures as you prefer)
+            conn = BinanceFuturesConnector()
+            df   = conn.fetch_ohlcv(symbol="TAO/USDT", timeframe="4h", limit=200)
+            df.columns = ["timestamp","open","high","low","close","volume"]  # ensure names
 
-            if not strategy:
+            # 2) pick strategy
+            strat = StrategyManager().get_strategy(strategy_name)
+            if not strat:
                 raise ValueError(f"Strategy '{strategy_name}' not found.")
 
+            # 3) backtest
             backtester = Backtester()
-            trades_df, capital = backtester.run_backtest(df, strategy)
+            trades_df, final_cap = backtester.run_backtest(df, strat)
 
-            if len(trades_df) == 0:
-                self.output.append("[INFO] No trades generated during backtest.")
-                return
+            # 4) display
+            if trades_df.empty:
+                self.output.append("[INFO] No trades generated during backtest.\n")
+            else:
+                # show final capital to 5 decimal places
+                self.output.append(f"[RESULT] Final Capital: ${final_cap:.5f}\n")
 
-            analyzer = PerformanceAnalyzer()
-            analysis = analyzer.analyze_trades(trades_df)
-
-            # Display result
-            self.output.append(f"\n[RESULT] Final Capital: ${capital:.2f}")
-            for key, value in analysis.items():
-                self.output.append(f"{key}: {value}")
+                # performance summary
+                analyzer = PerformanceAnalyzer()
+                stats = analyzer.analyze_trades(trades_df)
+                # print each stat on its own line
+                for k, v in stats.items():
+                    self.output.append(f"{k}: {v}")
+                self.output.append("")  # blank line
 
         except Exception as e:
-            self.output.append(f"[ERROR] {e}")
+            self.output.append(f"[ERROR] {e}\n")
+        finally:
+            self.backtest_button.setEnabled(True)
