@@ -14,6 +14,7 @@ class BacktestView(QWidget):
         self.layout = QVBoxLayout()
         self.select_label      = QLabel("Select Strategy:")
         self.strategy_selector = QComboBox()
+# in Dashboard.__init__ after creating self.strategy_selector:
         self.strategy_selector.addItems([
             "EMA Crossover",
             "RSI Divergence",
@@ -22,7 +23,19 @@ class BacktestView(QWidget):
             "SMA Crossover",
             "RSI+MACD Combo",
             "Donchian Breakout",
-            "BB+RSI Combo"
+            "BB+RSI Combo",
+            "MultiEMA Stochastic",
+            "VWAP Reversion",
+            "Ichimoku Breakout",
+            "Supertrend RSI",
+            "MACD Volume Surge",
+            "Keltner CCI Mean Reversion",
+            "Turtle Three Screen",
+            "Pivot Point Breakout",
+            "ADX Bollinger Squeeze",
+            "RSI MA Envelope",
+            "Machine Learning Signal",
+            "Pairs Trading"
         ])
 
         self.backtest_button   = QPushButton("Run Strategy Backtest")

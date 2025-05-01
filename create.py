@@ -1,270 +1,184 @@
 import os
 
-# Define the 12 new strategy file paths and their skeleton code
-strategies = {
-    "strategies/multi_ema_stochastic.py": """from ta.trend import EMAIndicator
-from ta.momentum import StochasticOscillator
-
-class MultiEMAStochasticStrategy:
-    def generate_signal(self, df):
-        df = df.copy()
-        # EMA Trend
-        df['ema_short'] = EMAIndicator(df['close'], window=20).ema_indicator()
-        df['ema_long']  = EMAIndicator(df['close'], window=50).ema_indicator()
-        # Stochastic Oscillator
-        stoch = StochasticOscillator(df['high'], df['low'], df['close'], window=14, smooth_window=3)
-        df['stoch'] = stoch.stoch()
-        
-        # Entry: EMAs bullish and Stoch oversold
-        df['signal'] = 0
-        df.loc[(df['ema_short'] > df['ema_long']) & (df['stoch'] < 20), 'signal'] = 1
-        df.loc[(df['ema_short'] < df['ema_long']) & (df['stoch'] > 80), 'signal'] = -1
-        
-        # Exit: EMA cross or Stoch mid-cross
-        df['exit_signal'] = 0
-        df.loc[(df['signal'].shift(1) == 1) & (df['stoch'] > 50), 'exit_signal'] = 1
-        df.loc[(df['signal'].shift(1) == -1) & (df['stoch'] < 50), 'exit_signal'] = -1
-        
-        return df
-""",
-    "strategies/vwap_reversion.py": """from ta.volume import VolumeWeightedAveragePrice
-
-class VWAPReversionStrategy:
-    def generate_signal(self, df):
-        df = df.copy()
-        vwap = VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['volume'], window=14)
-        df['vwap'] = vwap.volume_weighted_average_price()
-        df['deviation'] = (df['close'] - df['vwap']).abs()
-        
-        # Entry: price deviates > 1 ATR from VWAP
-        df['atr'] = df['deviation'].rolling(14).mean()
-        df['signal'] = 0
-        df.loc[df['close'] > df['vwap'] + df['atr'], 'signal'] = -1
-        df.loc[df['close'] < df['vwap'] - df['atr'], 'signal'] = 1
-        
-        df['exit_signal'] = 0
-        df.loc[(df['signal'].shift(1) == 1) & (df['close'] >= df['vwap']), 'exit_signal'] = 1
-        df.loc[(df['signal'].shift(1) == -1) & (df['close'] <= df['vwap']), 'exit_signal'] = -1
-        
-        return df
-""",
-    "strategies/ichimoku_breakout.py": """from ta.trend import IchimokuIndicator
-
-class IchimokuBreakoutStrategy:
-    def generate_signal(self, df):
-        df = df.copy()
-        ich = IchimokuIndicator(high=df['high'], low=df['low'], window1=9, window2=26, window3=52)
-        df['conversion'] = ich.ichimoku_conversion_line()
-        df['base']       = ich.ichimoku_base_line()
-        
-        # Entry: price above cloud and conversion > base
-        df['signal'] = 0
-        df.loc[(df['close'] > ich.ichimoku_a()) & (df['conversion'] > df['base']), 'signal'] = 1
-        df.loc[(df['close'] < ich.ichimoku_b()) & (df['conversion'] < df['base']), 'signal'] = -1
-        
-        df['exit_signal'] = 0
-        df.loc[(df['signal'].shift(1) == 1) & (df['conversion'] < df['base']), 'exit_signal'] = 1
-        df.loc[(df['signal'].shift(1) == -1) & (df['conversion'] > df['base']), 'exit_signal'] = -1
-        
-        return df
-""",
-    "strategies/supertrend_rsi.py": """from ta.trend import Supertrend
+# Create model_trainer.py
+model_trainer_code = """\
+import os
+import threading
+import time
+import yaml
+import pandas as pd
+import joblib
+import xgboost as xgb
+from datetime import datetime, timedelta
+from exchange.binance_connector import BinanceFuturesConnector
+from ta.trend import MACD
 from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange, BollingerBands
+from sklearn.model_selection import train_test_split
 
-class SupertrendRSIStrategy:
-    def generate_signal(self, df):
-        df = df.copy()
-        st = Supertrend(high=df['high'], low=df['low'], close=df['close'], window=10, multiplier=3)
-        df['supertrend'] = st.supertrend()
-        df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
-        
-        df['signal'] = 0
-        df.loc[(df['supertrend'] == True) & (df['rsi'] < 60), 'signal'] = 1
-        df.loc[(df['supertrend'] == False) & (df['rsi'] > 40), 'signal'] = -1
-        
-        df['exit_signal'] = 0
-        df.loc[(df['signal'].shift(1) == 1) & (df['rsi'] > 70), 'exit_signal'] = 1
-        df.loc[(df['signal'].shift(1) == -1) & (df['rsi'] < 30), 'exit_signal'] = -1
-        
+class ModelTrainer:
+    def __init__(self, config_path="config.yaml"):
+        # load settings
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+
+        self.symbol       = cfg["symbol"]
+        self.timeframes   = ["5m", "15m", "1h", "4h"]
+        self.limit        = cfg.get("limit", 1000)
+        self.model_dir    = cfg.get("model_dir", "models")
+        os.makedirs(self.model_dir, exist_ok=True)
+
+        self.connector    = BinanceFuturesConnector()
+
+    def fetch_data(self, timeframe):
+        df = self.connector.fetch_ohlcv(
+            symbol=self.symbol,
+            timeframe=timeframe,
+            limit=self.limit
+        )
+        df.columns = ["timestamp","open","high","low","close","volume"]
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         return df
-""",
-    "strategies/macd_volume_surge.py": """from ta.trend import MACD
-from ta.volume import VolumeWeightedAveragePrice
 
-class MACDVolumeSurgeStrategy:
-    def generate_signal(self, df):
-        df = df.copy()
-        macd = MACD(close=df['close'], window_slow=26, window_fast=12, window_sign=9)
-        df['macd_hist'] = macd.macd_diff()
-        df['vwap'] = VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['volume'], window=20).volume_weighted_average_price()
-        
-        df['signal'] = 0
-        df.loc[(df['macd_hist'] > 0) & (df['volume'] > df['volume'].rolling(20).mean()*2), 'signal'] = 1
-        df.loc[(df['macd_hist'] < 0) & (df['volume'] > df['volume'].rolling(20).mean()*2), 'signal'] = -1
-        
-        df['exit_signal'] = 0
-        df.loc[(df['signal'].shift(1) == 1) & (df['macd_hist'] < 0), 'exit_signal'] = 1
-        df.loc[(df['signal'].shift(1) == -1) & (df['macd_hist'] > 0), 'exit_signal'] = -1
-        
-        return df
-""",
-    "strategies/keltner_cci_mean_reversion.py": """from ta.trend import KeltnerChannel
-from ta.trend import CCIIndicator
+    def prepare_features(self, df):
+        # EMA spread
+        df["ema9"]  = df["close"].ewm(span=9).mean()
+        df["ema21"] = df["close"].ewm(span=21).mean()
+        df["ema_spread"] = df["ema9"] - df["ema21"]
+        # RSI
+        df["rsi"]  = RSIIndicator(df["close"], window=14).rsi()
+        # ATR
+        df["atr"]  = AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+        # MACD hist
+        macd = MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+        df["macd_hist"] = macd.macd_diff()
+        # Volume ratio
+        df["vol_ma10"] = df["volume"].rolling(10).mean()
+        df["vol_ratio"] = df["volume"] / df["vol_ma10"]
+        # Lagged return
+        df["lag_return"] = df["close"].pct_change()
+        # Bollinger bandwidth
+        bb = BollingerBands(df["close"], window=20, window_dev=2)
+        df["bb_bandwidth"] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
 
-class KeltnerCCIMeanReversionStrategy:
-    def generate_signal(self, df):
-        df = df.copy()
-        kc = KeltnerChannel(high=df['high'], low=df['low'], close=df['close'], window=20, window_atr=10)
-        df['kc_lower'] = kc.keltner_channel_lband()
-        df['kc_upper'] = kc.keltner_channel_hband()
-        df['cci'] = CCIIndicator(high=df['high'], low=df['low'], close=df['close'], window=20).cci()
-        
-        df['signal'] = 0
-        df.loc[(df['close'] < df['kc_lower']) & (df['cci'] < -100), 'signal'] = 1
-        df.loc[(df['close'] > df['kc_upper']) & (df['cci'] > 100), 'signal'] = -1
-        
-        df['exit_signal'] = 0
-        df.loc[(df['signal'].shift(1) == 1) & (df['cci'] > 0), 'exit_signal'] = 1
-        df.loc[(df['signal'].shift(1) == -1) & (df['cci'] < 0), 'exit_signal'] = -1
-        
-        return df
-""",
-    "strategies/turtle_three_screen.py": """from ta.volatility import DonchianChannel
+        # drop NaNs
+        feature_cols = ["ema_spread", "rsi", "atr", "macd_hist", 
+                        "vol_ratio", "lag_return", "bb_bandwidth"]
+        df = df.dropna(subset=feature_cols + ["close"])
+        X = df[feature_cols]
+        # target: next-bar up/down
+        df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
+        y = df["target"].iloc[:-1]
+        X = X.iloc[:-1]
+        return X, y
 
-class TurtleThreeScreenStrategy:
-    def generate_signal(self, df):
-        df = df.copy()
-        dc20 = DonchianChannel(high=df['high'], low=df['low'], window=20)
-        dc55 = DonchianChannel(high=df['high'], low=df['low'], window=55)
-        df['breakout20'] = df['close'] > dc20.donchian_channel_hband()
-        df['trend55'] = df['close'] > dc55.donchian_channel_hband()
-        
-        df['signal'] = 0
-        df.loc[(df['breakout20']) & (df['trend55']), 'signal'] = 1
-        df.loc[(~df['breakout20']) & (~df['trend55']), 'signal'] = -1
-        
-        df['exit_signal'] = 0
-        df.loc[(df['signal'].shift(1) == 1) & (~df['trend55']), 'exit_signal'] = 1
-        df.loc[(df['signal'].shift(1) == -1) & (df['trend55']), 'exit_signal'] = -1
-        
-        return df
-""",
-    "strategies/pivot_point_breakout.py": """# Requires pivot point calculation library or custom implementation
-import pandas as pd
+    def train_timeframe(self, tf):
+        print(f"[TRAIN] Fetching data for {tf}")
+        df = self.fetch_data(tf)
+        X, y = self.prepare_features(df)
+        if len(y) < 50:
+            print(f"[SKIP] Not enough data for {tf}")
+            return
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+        model = xgb.XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.1, use_label_encoder=False, eval_metric='logloss')
+        model.fit(
+            X_train, y_train, 
+            eval_set=[(X_test, y_test)],
+            early_stopping_rounds=10,
+            verbose=False
+        )
+        path = os.path.join(self.model_dir, f"model_{tf}.pkl")
+        joblib.dump(model, path)
+        print(f"[SAVE] Model saved to {path}")
 
-def calculate_pivots(df):
-    # Basic pivot point calculation
-    df['pp'] = (df['high'] + df['low'] + df['close']) / 3
-    df['r1'] = 2 * df['pp'] - df['low']
-    df['s1'] = 2 * df['pp'] - df['high']
-    return df
+    def run_all(self):
+        for tf in self.timeframes:
+            try:
+                self.train_timeframe(tf)
+            except Exception as e:
+                print(f"[ERROR] {tf}: {e}")
 
-class PivotPointBreakoutStrategy:
-    def generate_signal(self, df):
-        df = calculate_pivots(df.copy())
-        df['signal'] = 0
-        df.loc[df['close'] > df['r1'], 'signal'] = 1
-        df.loc[df['close'] < df['s1'], 'signal'] = -1
-        
-        df['exit_signal'] = 0
-        df.loc[(df['signal'].shift(1) == 1) & (df['close'] < df['pp']), 'exit_signal'] = 1
-        df.loc[(df['signal'].shift(1) == -1) & (df['close'] > df['pp']), 'exit_signal'] = -1
-        
-        return df
-""",
-    "strategies/adx_bollinger_squeeze.py": """from ta.volatility import BollingerBands
-from ta.trend import ADXIndicator
-
-class ADXBollingerSqueezeStrategy:
-    def generate_signal(self, df):
-        df = df.copy()
-        bb = BollingerBands(df['close'], window=20, window_dev=2)
-        df['bandwidth'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
-        df['adx'] = ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
-        
-        df['signal'] = 0
-        df.loc[(df['bandwidth'] < 0.05) & (df['adx'] > 25), 'signal'] = 1
-        df.loc[(df['bandwidth'] < 0.05) & (df['adx'] > 25), 'signal'] = -1  # adapt for short if needed
-        
-        df['exit_signal'] = 0
-        df.loc[df['adx'] < 20, 'exit_signal'] = df['signal'].shift(1)
-        
-        return df
-""",
-    "strategies/rsi_ma_envelope.py": """from ta.momentum import RSIIndicator
-from ta.trend import SMAIndicator
-
-class RSIMovingAverageEnvelopeStrategy:
-    def generate_signal(self, df):
-        df = df.copy()
-        df['sma'] = SMAIndicator(df['close'], window=20).sma_indicator()
-        df['upper_env'] = df['sma'] * 1.05
-        df['lower_env'] = df['sma'] * 0.95
-        df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
-        
-        df['signal'] = 0
-        df.loc[(df['close'] > df['upper_env']) & (df['rsi'] < 50), 'signal'] = -1
-        df.loc[(df['close'] < df['lower_env']) & (df['rsi'] > 50), 'signal'] = 1
-        
-        df['exit_signal'] = 0
-        df.loc[(df['signal'].shift(1) == 1) & (df['close'] >= df['sma']), 'exit_signal'] = 1
-        df.loc[(df['signal'].shift(1) == -1) & (df['close'] <= df['sma']), 'exit_signal'] = -1
-        
-        return df
-""",
-    "strategies/ml_signal.py": """# Placeholder for a machine-learning based signal
-import pandas as pd
-
-class MachineLearningSignalStrategy:
-    def generate_signal(self, df):
-        df = df.copy()
-        # TODO: load your trained ML model and generate predictions
-        df['signal'] = 0
-        # Example: df['signal'] = model.predict(df[features])
-        df['exit_signal'] = 0
-        return df
-""",
-    "strategies/pairs_trading.py": """import pandas as pd
-
-class PairsTradingStrategy:
-    def generate_signal(self, df):
-        df = df.copy()
-        # TODO: implement cointegration test & z-score of spread
-        df['signal'] = 0
-        df['exit_signal'] = 0
-        return df
-"""
-}
-
-def main():
-    # Create strategy files
-    for path, content in strategies.items():
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-    print("Created the following strategy files:")
-    for p in strategies:
-        print(" -", p)
-    
-    # Print instructions for updating strategy_manager.py
-    print("\nAdd these lines to your `strategies/strategy_manager.py`:\n")
-    print("    # Auto-generated strategies")
-    for filename in strategies:
-        class_name = os.path.splitext(os.path.basename(filename))[0]
-        # Convert file name to Strategy class names and loader names
-        loader_name = f"load_{class_name}"
-        strategy_name = class_name.replace('_', ' ').title()
-        print(f'        "{strategy_name}": self.{loader_name}(),')
-    print("\nAnd append these loader methods to the StrategyManager class:\n")
-    for filename in strategies:
-        class_name = os.path.splitext(os.path.basename(filename))[0]
-        loader_name = f"load_{class_name}"
-        class_title = class_name.replace('_', ' ').title().replace(' ', '')
-        print(f"    def {loader_name}(self):")
-        print(f"        from strategies.{class_name} import {class_title}Strategy")
-        print(f"        return {class_title}Strategy()")
-        print()
+    def schedule_hourly(self):
+        # run immediately on start
+        self.run_all()
+        while True:
+            now = datetime.now()
+            # next top of hour
+            next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            sleep_secs = (next_hour - now).total_seconds()
+            time.sleep(sleep_secs)
+            self.run_all()
 
 if __name__ == "__main__":
-    main()
+    trainer = ModelTrainer()
+    thread  = threading.Thread(target=trainer.schedule_hourly, daemon=True)
+    thread.start()
+    # keep main thread alive
+    while True:
+        time.sleep(3600)
+"""
 
+with open("model_trainer.py", "w", encoding="utf-8") as f:
+    f.write(model_trainer_code)
+
+# Create updated ml_signal.py
+ml_signal_code = """\
+# strategies/ml_signal.py
+
+import yaml
+import joblib
+import pandas as pd
+from ta.trend import MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange, BollingerBands
+
+class MachineLearningSignalStrategy:
+    def __init__(self):
+        # load config
+        with open("config.yaml", "r") as f:
+            cfg = yaml.safe_load(f)
+        self.timeframe = cfg["timeframe"]
+        model_dir = cfg.get("model_dir", "models")
+        model_path = f"{model_dir}/model_{self.timeframe}.pkl"
+        # load model
+        self.model = joblib.load(model_path)
+        # define feature columns
+        self.features = [
+            "ema_spread", "rsi", "atr", "macd_hist",
+            "vol_ratio", "lag_return", "bb_bandwidth"
+        ]
+
+    def generate_signal(self, df):
+        df = df.copy()
+        # compute features
+        df["ema9"]  = df["close"].ewm(span=9).mean()
+        df["ema21"] = df["close"].ewm(span=21).mean()
+        df["ema_spread"] = df["ema9"] - df["ema21"]
+        df["rsi"]  = RSIIndicator(df["close"], window=14).rsi()
+        df["atr"]  = AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+        macd = MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+        df["macd_hist"] = macd.macd_diff()
+        df["vol_ma10"] = df["volume"].rolling(10).mean()
+        df["vol_ratio"] = df["volume"] / df["vol_ma10"]
+        df["lag_return"] = df["close"].pct_change()
+        bb = BollingerBands(df["close"], window=20, window_dev=2)
+        df["bb_bandwidth"] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
+
+        # drop NaNs and select features
+        df = df.dropna(subset=self.features)
+        X = df[self.features]
+
+        # predict next-bar direction
+        preds = self.model.predict(X)
+        # map {1: up, 0: down} → {1, -1}
+        df["signal"] = pd.Series(preds, index=X.index).map({1: 1, 0: -1})
+
+        df["exit_signal"] = 0
+        return df
+"""
+
+os.makedirs("strategies", exist_ok=True)
+with open("strategies/ml_signal.py", "w", encoding="utf-8") as f:
+    f.write(ml_signal_code)
+
+print("Created model_trainer.py and updated strategies/ml_signal.py")

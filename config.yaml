@@ -1,6 +1,6 @@
 # === Market / Timeframe ===
 symbol:        BTC/USDT
-timeframe:     "2h"
+timeframe:     "4h"
 limit:         100
 poll_interval: 500
 
