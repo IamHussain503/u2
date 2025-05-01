@@ -1,24 +1,32 @@
-# Trading parameters
-symbol: TAO/USDT
-timeframe: "4h"          # candle interval for fetch_ohlcv
-limit: 200              # number of candles to fetch
-poll_interval: 60        # seconds between loops
+# === Market / Timeframe ===
+symbol:        BTC/USDT
+timeframe:     "2h"
+limit:         100
+poll_interval: 500
 
-# Risk & sizing
-initial_capital: 10000      # starting capital (USDT)
-leverage: 10
-risk_per_trade: 0.01     # fraction of balance risked per trade
+# === Capital & Risk ===
+initial_capital: 1000
+leverage:        50
+risk_per_trade:  0.2
 
-# ATR-based stop/target
-atr_window: 14           # look-back for ATR
-atr_multiplier: 2.0      # stop-loss = entry ± (ATR * this)
-tp_multiplier: 3.0       # take-profit = entry ± (ATR * this)
+# === ATR / Stop-Target ===
+atr_window:     20
+atr_multiplier: 2.0        # static stop-loss = 2×ATR
+tp_multiplier:  3.5        # take-profit   = 3.5×ATR
+trailing_atr_multiplier: 1.5  # trailing stop = 1.5×ATR below peak
 
-# Fees
-maker_fee: 0.0002        # 0.02%
-taker_fee: 0.0004        # 0.04%
+# === Trend Filter ===
+adx_window:     14
+adx_threshold:  25
+ma_period:      200
 
-# Misc
-paper_mode: false
-font_size: 14
+# === Time-Stop ===
+max_holding_bars: 48
+
+# === Fees ===
+maker_fee:      0.0002
+taker_fee:      0.0004
+
+# === Misc ===
+paper_mode:     false
 trade_log_file: data/trades.csv

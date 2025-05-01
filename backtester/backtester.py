@@ -11,8 +11,8 @@ class Backtester:
         with open(config_path, "r") as f:
             cfg = yaml.safe_load(f)
 
-        self.initial_capital = float(cfg.get("initial_capital", 10000.0))
-        self.leverage        = int(cfg.get("leverage", 1))
+        self.initial_capital = float(cfg.get("initial_capital", 1000.0))
+        self.leverage        = int(cfg.get("leverage", 10))
         self.risk_per_trade  = float(cfg.get("risk_per_trade", 0.01))
 
         self.atr_window      = int(cfg.get("atr_window", 14))
@@ -81,6 +81,9 @@ class Backtester:
                     leverage=self.leverage,
                     risk_percent=self.risk_per_trade
                 )
+                if entry_size <= 0:
+                # ATR was zero or too little data—skip this signal
+                    continue
                 continue
 
             # --- ENTRY SHORT ---
