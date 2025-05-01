@@ -14,7 +14,17 @@ class BacktestView(QWidget):
         self.layout = QVBoxLayout()
         self.select_label      = QLabel("Select Strategy:")
         self.strategy_selector = QComboBox()
-        self.strategy_selector.addItems(["EMA Crossover", "RSI Divergence", "Bollinger Breakout"])
+        self.strategy_selector.addItems([
+            "EMA Crossover",
+            "RSI Divergence",
+            "Bollinger Breakout",
+            "MACD Crossover",
+            "SMA Crossover",
+            "RSI+MACD Combo",
+            "Donchian Breakout",
+            "BB+RSI Combo"
+        ])
+
         self.backtest_button   = QPushButton("Run Strategy Backtest")
         self.output            = QTextEdit()
         self.output.setReadOnly(True)
