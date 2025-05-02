@@ -1,13 +1,13 @@
 # === Market / Timeframe ===
 symbol:        BTC/USDT
-timeframe:     "4h"
-limit:         100
+timeframe:     "1h"
+limit:         1000
 poll_interval: 500
 
 # === Capital & Risk ===
 initial_capital: 1000
 leverage:        50
-risk_per_trade:  0.2
+risk_per_trade:  0.5
 
 # === ATR / Stop-Target ===
 atr_window:     20
@@ -30,3 +30,7 @@ taker_fee:      0.0004
 # === Misc ===
 paper_mode:     false
 trade_log_file: data/trades.csv
+
+
+commission: 0.0004      # 0.04%
+slippage:   0.0005      # 0.05%

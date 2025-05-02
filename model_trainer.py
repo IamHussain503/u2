@@ -20,10 +20,10 @@ class ModelTrainer:
         self.symbol     = cfg["symbol"]
         self.timeframes = ["5m", "15m", "1h", "4h"]
         self.tf_limits  = {
-            "5m": 1000,
-            "15m": 800,
-            "1h": 300,
-            "4h": 200
+            "5m": 100000,
+            "15m": 100000,
+            "1h": 10000,
+            "4h": 500,
         }
         self.model_dir  = cfg.get("model_dir", "models")
         os.makedirs(self.model_dir, exist_ok=True)

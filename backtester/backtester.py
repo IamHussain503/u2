@@ -1,5 +1,6 @@
 # backtester/backtester.py
 
+import os
 import pandas as pd
 import ta
 import yaml
@@ -19,7 +20,9 @@ class Backtester:
         self.atr_mult        = float(cfg.get("atr_multiplier", 1.5))
         self.tp_mult         = float(cfg.get("tp_multiplier", 3.0))
 
+        # realistic backtest parameters
         self.fee_rate        = float(cfg.get("taker_fee", 0.0004))
+        self.slippage        = float(cfg.get("slippage", 0.0005))
 
         self.risk_manager    = RiskManager()
 
@@ -29,7 +32,7 @@ class Backtester:
         if "timestamp" not in df.columns:
             df = df.reset_index().rename(columns={"index": "timestamp"})
 
-        # generate entry/exit signals
+        # generate signals
         df = strategy.generate_signal(df)
 
         # compute ATR
@@ -49,7 +52,7 @@ class Backtester:
 
         trades = []
 
-        # helper columns for cross logic
+        # helper for previous signal and exit_signal
         df["prev_sig"] = df["signal"].shift(1).fillna(0).astype(int)
         exit_sig       = df.get("exit_signal", pd.Series(0, index=df.index)).astype(int)
 
@@ -59,16 +62,18 @@ class Backtester:
             ex_sig = int(exit_sig.loc[row.name])
             price  = float(row["close"])
             atr    = float(row["atr"])
+            h      = float(row["high"])
+            l      = float(row["low"])
             ts     = row["timestamp"]
 
-            # --- ENTRY LONG ---
+            # ENTRY LONG
             if not in_position and sig == 1 and prev != 1:
                 in_position   = True
                 direction     = "long"
-                entry_price   = price
+                entry_price   = price * (1 + self.slippage)
                 entry_time    = ts
                 entry_atr     = atr
-                sl_price      = entry_price - (atr * self.tp_mult)
+                sl_price      = entry_price - (atr * self.atr_mult)
                 tp_price      = entry_price + (atr * self.tp_mult)
                 highest_price = entry_price
 
@@ -82,18 +87,17 @@ class Backtester:
                     risk_percent=self.risk_per_trade
                 )
                 if entry_size <= 0:
-                # ATR was zero or too little data—skip this signal
-                    continue
+                    in_position = False
                 continue
 
-            # --- ENTRY SHORT ---
+            # ENTRY SHORT
             if not in_position and sig == -1 and prev != -1:
                 in_position   = True
                 direction     = "short"
-                entry_price   = price
+                entry_price   = price * (1 - self.slippage)
                 entry_time    = ts
                 entry_atr     = atr
-                sl_price      = entry_price + (atr * self.tp_mult)
+                sl_price      = entry_price + (atr * self.atr_mult)
                 tp_price      = entry_price - (atr * self.tp_mult)
                 lowest_price  = entry_price
 
@@ -105,48 +109,59 @@ class Backtester:
                     leverage=self.leverage,
                     risk_percent=self.risk_per_trade
                 )
+                if entry_size <= 0:
+                    in_position = False
                 continue
 
-            # --- MANAGE POSITION ---
+            # MANAGE POSITION
             if in_position:
-                reason = None
+                reason      = None
+                exit_price  = price  # default if exit later
 
                 if direction == "long":
                     highest_price = max(highest_price, price)
-                    trailing_price = highest_price - (entry_atr * self.atr_mult)
+                    trail_price   = highest_price - (entry_atr * self.atr_mult)
 
-                    if price <= sl_price:
-                        reason = "Ultimate SL"
-                    elif price >= tp_price:
-                        reason = "Take Profit"
-                    elif price <= trailing_price:
-                        reason = "Trailing SL"
+                    # check intra-bar stops/targets
+                    if l <= sl_price:
+                        reason     = "Ultimate SL"
+                        exit_price = sl_price * (1 - self.slippage)
+                    elif h >= tp_price:
+                        reason     = "Take Profit"
+                        exit_price = tp_price * (1 - self.slippage)
+                    elif l <= trail_price:
+                        reason     = "Trailing SL"
+                        exit_price = trail_price * (1 - self.slippage)
                     elif ex_sig == 1:
-                        reason = "Strategy Exit"
+                        reason     = "Strategy Exit"
+                        exit_price = price * (1 - self.slippage)
 
                 else:  # short
                     lowest_price = min(lowest_price, price)
-                    trailing_price = lowest_price + (entry_atr * self.atr_mult)
+                    trail_price   = lowest_price + (entry_atr * self.atr_mult)
 
-                    if price >= sl_price:
-                        reason = "Ultimate SL"
-                    elif price <= tp_price:
-                        reason = "Take Profit"
-                    elif price >= trailing_price:
-                        reason = "Trailing SL"
+                    if h >= sl_price:
+                        reason     = "Ultimate SL"
+                        exit_price = sl_price * (1 + self.slippage)
+                    elif l <= tp_price:
+                        reason     = "Take Profit"
+                        exit_price = tp_price * (1 + self.slippage)
+                    elif h >= trail_price:
+                        reason     = "Trailing SL"
+                        exit_price = trail_price * (1 + self.slippage)
                     elif ex_sig == -1:
-                        reason = "Strategy Exit"
+                        reason     = "Strategy Exit"
+                        exit_price = price * (1 + self.slippage)
 
                 if reason:
                     # compute P&L
                     if direction == "long":
-                        gross = (price - entry_price) * entry_size
+                        gross = (exit_price - entry_price) * entry_size
                     else:
-                        gross = (entry_price - price) * entry_size
+                        gross = (entry_price - exit_price) * entry_size
 
-                    fees = (entry_price + price) * entry_size * self.fee_rate
+                    fees = (entry_price + exit_price) * entry_size * self.fee_rate
                     net  = gross - fees
-
                     capital += net
 
                     trades.append({
@@ -154,13 +169,12 @@ class Backtester:
                         "exit_time":   ts,
                         "direction":   direction,
                         "entry_price": round(entry_price, 5),
-                        "exit_price":  round(price,       5),
-                        "size":        round(entry_size,  5),
-                        "gross_pnl":   round(gross,       5),
-                        "fees":        round(fees,        5),
-                        "net_pnl":     round(net,         5),
-                        # **add a standard 'profit' column for the analyzer**
-                        "profit":      round(net,         5),
+                        "exit_price":  round(exit_price, 5),
+                        "size":        round(entry_size, 5),
+                        "gross_pnl":   round(gross, 5),
+                        "fees":        round(fees, 5),
+                        "net_pnl":     round(net, 5),
+                        "profit":      round(net, 5),
                         "reason":      reason
                     })
 
@@ -172,3 +186,8 @@ class Backtester:
                     direction     = None
 
         return pd.DataFrame(trades), capital
+
+# Example usage:
+# backtester = Backtester()
+# trades_df, final_capital = backtester.run_backtest(df, strategy)
+

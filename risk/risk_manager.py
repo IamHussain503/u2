@@ -3,33 +3,30 @@
 import math
 
 class RiskManager:
-    def calculate_position_size(self,
-                                balance: float,
-                                price:   float,
-                                stop_loss: float,
-                                leverage:    int = 10,
-                                risk_percent: float = 0.01) -> float:
+    def calculate_position_size(
+        self,
+        balance: float,
+        price: float,
+        stop_loss: float,
+        leverage: int = 1,
+        risk_percent: float = 0.01
+    ) -> float:
         """
-        Returns how many contracts/units to trade given:
-         - balance (account equity),
-         - current price,
-         - absolute price-distance to your stop (stop_loss),
-         - leverage,
-         - risk_percent of balance to risk.
+        balance         : account equity in quote currency (e.g. USDT)
+        price           : current symbol price
+        stop_loss       : absolute price distance to stop (e.g. ATR * multiplier)
+        leverage        : contract leverage
+        risk_percent    : fraction of balance to risk (e.g. 0.01 → 1%)
         """
-
-        # 1) guard against zero/negative/NaN stops or prices
-        if not math.isfinite(stop_loss) or stop_loss <= 0:
-            # can't size a position if your stop distance is zero or invalid
-            return 0.0
-        if not math.isfinite(price) or price <= 0:
+        # 1) sanity checks
+        if stop_loss <= 0 or price <= 0 or not math.isfinite(stop_loss) or not math.isfinite(price):
             return 0.0
 
-        # 2) compute risk amount and raw contract count
-        risk_amount   = balance * risk_percent
-        contracts     = risk_amount / (stop_loss * price)
+        # 2) $ amount you risk if stop is hit
+        risk_amount = balance * risk_percent
 
-        # 3) apply leverage
-        position_size = contracts * leverage
+        # 3) contracts = risk_amount / (stop_loss * price) 
+        contracts = risk_amount / (stop_loss * price)
 
-        return position_size
+        # 4) apply leverage
+        return contracts * leverage
