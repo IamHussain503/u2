@@ -1,18 +1,18 @@
 # === Market / Timeframe ===
 symbol:        BTC/USDT
-timeframe:     "1h"
-limit:         1000
+timeframe:     "4h"
+limit:         100000
 poll_interval: 500
 
 # === Capital & Risk ===
-initial_capital: 1000
+initial_capital: 10000
 leverage:        50
-risk_per_trade:  0.5
+risk_per_trade:  1
 
 # === ATR / Stop-Target ===
 atr_window:     20
-atr_multiplier: 2.0        # static stop-loss = 2×ATR
-tp_multiplier:  3.5        # take-profit   = 3.5×ATR
+atr_multiplier: 1.2        # static stop-loss = 2×ATR
+tp_multiplier:  2.0        # take-profit   = 3.5×ATR
 trailing_atr_multiplier: 1.5  # trailing stop = 1.5×ATR below peak
 
 # === Trend Filter ===
@@ -34,3 +34,7 @@ trade_log_file: data/trades.csv
 
 commission: 0.0004      # 0.04%
 slippage:   0.0005      # 0.05%
+
+
+atr_multiplier:           1.5     # static SL = 1.5×ATR
+trailing_atr_multiplier:  1.0     # trail = 1.0×ATR (or smaller)

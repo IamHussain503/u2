@@ -8,8 +8,8 @@ class Config(BaseModel):
     limit:             int   = 500
     poll_interval:     int   = 60
     initial_capital:   float = 1000.0
-    leverage:          int   = 1
-    risk_per_trade:    float = 0.01
+    leverage:          int   = 20
+    risk_per_trade:    float = 1
     atr_window:        int   = 14
     atr_multiplier:    float = 1.5
     tp_multiplier:     float = 3.0

@@ -40,5 +40,8 @@ class MachineLearningSignalStrategy:
         X = df[self.features]
         preds = self.model.predict(X)
         df["signal"] = pd.Series(preds, index=X.index).map({1:1, 0:-1})
-        df["exit_signal"] = 0
+
+        # **NEW EXIT**: when the next row’s signal ≠ current, exit
+        df["exit_signal"] = df["signal"].shift(-1).fillna(0).astype(int)
+        df.loc[df["exit_signal"] == df["signal"], "exit_signal"] = 0
         return df

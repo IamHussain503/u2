@@ -1,0 +1,2225 @@
+File: C:\bot\U2\u2\create.py
+============================
+
+import os
+
+# Create model_trainer.py
+model_trainer_code = """\
+import os
+import threading
+import time
+import yaml
+import pandas as pd
+import joblib
+import xgboost as xgb
+from datetime import datetime, timedelta
+from exchange.binance_connector import BinanceFuturesConnector
+from ta.trend import MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange, BollingerBands
+from sklearn.model_selection import train_test_split
+
+class ModelTrainer:
+    def __init__(self, config_path="config.yaml"):
+        # load settings
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+
+        self.symbol       = cfg["symbol"]
+        self.timeframes   = ["5m", "15m", "1h", "4h"]
+        self.limit        = cfg.get("limit", 1000)
+        self.model_dir    = cfg.get("model_dir", "models")
+        os.makedirs(self.model_dir, exist_ok=True)
+
+        self.connector    = BinanceFuturesConnector()
+
+    def fetch_data(self, timeframe):
+        df = self.connector.fetch_ohlcv(
+            symbol=self.symbol,
+            timeframe=timeframe,
+            limit=self.limit
+        )
+        df.columns = ["timestamp","open","high","low","close","volume"]
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        return df
+
+    def prepare_features(self, df):
+        # EMA spread
+        df["ema9"]  = df["close"].ewm(span=9).mean()
+        df["ema21"] = df["close"].ewm(span=21).mean()
+        df["ema_spread"] = df["ema9"] - df["ema21"]
+        # RSI
+        df["rsi"]  = RSIIndicator(df["close"], window=14).rsi()
+        # ATR
+        df["atr"]  = AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+        # MACD hist
+        macd = MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+        df["macd_hist"] = macd.macd_diff()
+        # Volume ratio
+        df["vol_ma10"] = df["volume"].rolling(10).mean()
+        df["vol_ratio"] = df["volume"] / df["vol_ma10"]
+        # Lagged return
+        df["lag_return"] = df["close"].pct_change()
+        # Bollinger bandwidth
+        bb = BollingerBands(df["close"], window=20, window_dev=2)
+        df["bb_bandwidth"] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
+
+        # drop NaNs
+        feature_cols = ["ema_spread", "rsi", "atr", "macd_hist", 
+                        "vol_ratio", "lag_return", "bb_bandwidth"]
+        df = df.dropna(subset=feature_cols + ["close"])
+        X = df[feature_cols]
+        # target: next-bar up/down
+        df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
+        y = df["target"].iloc[:-1]
+        X = X.iloc[:-1]
+        return X, y
+
+    def train_timeframe(self, tf):
+        print(f"[TRAIN] Fetching data for {tf}")
+        df = self.fetch_data(tf)
+        X, y = self.prepare_features(df)
+        if len(y) < 50:
+            print(f"[SKIP] Not enough data for {tf}")
+            return
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+        model = xgb.XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.1, use_label_encoder=False, eval_metric='logloss')
+        model.fit(
+            X_train, y_train, 
+            eval_set=[(X_test, y_test)],
+            early_stopping_rounds=10,
+            verbose=False
+        )
+        path = os.path.join(self.model_dir, f"model_{tf}.pkl")
+        joblib.dump(model, path)
+        print(f"[SAVE] Model saved to {path}")
+
+    def run_all(self):
+        for tf in self.timeframes:
+            try:
+                self.train_timeframe(tf)
+            except Exception as e:
+                print(f"[ERROR] {tf}: {e}")
+
+    def schedule_hourly(self):
+        # run immediately on start
+        self.run_all()
+        while True:
+            now = datetime.now()
+            # next top of hour
+            next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            sleep_secs = (next_hour - now).total_seconds()
+            time.sleep(sleep_secs)
+            self.run_all()
+
+if __name__ == "__main__":
+    trainer = ModelTrainer()
+    thread  = threading.Thread(target=trainer.schedule_hourly, daemon=True)
+    thread.start()
+    # keep main thread alive
+    while True:
+        time.sleep(3600)
+"""
+
+with open("model_trainer.py", "w", encoding="utf-8") as f:
+    f.write(model_trainer_code)
+
+# Create updated ml_signal.py
+ml_signal_code = """\
+# strategies/ml_signal.py
+
+import yaml
+import joblib
+import pandas as pd
+from ta.trend import MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange, BollingerBands
+
+class MachineLearningSignalStrategy:
+    def __init__(self):
+        # load config
+        with open("config.yaml", "r") as f:
+            cfg = yaml.safe_load(f)
+        self.timeframe = cfg["timeframe"]
+        model_dir = cfg.get("model_dir", "models")
+        model_path = f"{model_dir}/model_{self.timeframe}.pkl"
+        # load model
+        self.model = joblib.load(model_path)
+        # define feature columns
+        self.features = [
+            "ema_spread", "rsi", "atr", "macd_hist",
+            "vol_ratio", "lag_return", "bb_bandwidth"
+        ]
+
+    def generate_signal(self, df):
+        df = df.copy()
+        # compute features
+        df["ema9"]  = df["close"].ewm(span=9).mean()
+        df["ema21"] = df["close"].ewm(span=21).mean()
+        df["ema_spread"] = df["ema9"] - df["ema21"]
+        df["rsi"]  = RSIIndicator(df["close"], window=14).rsi()
+        df["atr"]  = AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+        macd = MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+        df["macd_hist"] = macd.macd_diff()
+        df["vol_ma10"] = df["volume"].rolling(10).mean()
+        df["vol_ratio"] = df["volume"] / df["vol_ma10"]
+        df["lag_return"] = df["close"].pct_change()
+        bb = BollingerBands(df["close"], window=20, window_dev=2)
+        df["bb_bandwidth"] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
+
+        # drop NaNs and select features
+        df = df.dropna(subset=self.features)
+        X = df[self.features]
+
+        # predict next-bar direction
+        preds = self.model.predict(X)
+        # map {1: up, 0: down} → {1, -1}
+        df["signal"] = pd.Series(preds, index=X.index).map({1: 1, 0: -1})
+
+        df["exit_signal"] = 0
+        return df
+"""
+
+os.makedirs("strategies", exist_ok=True)
+with open("strategies/ml_signal.py", "w", encoding="utf-8") as f:
+    f.write(ml_signal_code)
+
+print("Created model_trainer.py and updated strategies/ml_signal.py")
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\main.py
+==========================
+
+import sys
+from PyQt6.QtWidgets import QApplication
+from gui.main_window import MainWindow
+
+# main.py
+
+from model_trainer import start_background_training
+
+def main():
+    # 1) start background training (will also run immediately once)
+    start_background_training()
+
+    # 2) now launch your Qt GUI
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\merge.py
+===========================
+
+import os
+
+def merge_py_files_to_text(root_dir, output_file):
+    with open(output_file, 'w', encoding='utf-8') as outfile:
+        for subdir, _, files in os.walk(root_dir):
+            for file in files:
+                if file.endswith('.py'):
+                    filepath = os.path.join(subdir, file)
+                    outfile.write(f"File: {filepath}\n")
+                    outfile.write("=" * (len(filepath) + 6) + "\n\n")
+
+                    with open(filepath, 'r', encoding='utf-8') as infile:
+                        outfile.write(infile.read())
+
+                    outfile.write("\n" + "-"*80 + "\n\n")
+
+# Usage Example
+root_directory = "C:\\bot\\U2\\u2\\"
+output_file = "merged_scripts.txt"
+
+merge_py_files_to_text(root_directory, output_file)
+
+print(f"All .py files merged into {output_file}")
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\model_trainer.py
+===================================
+
+import os
+import threading
+import time
+import yaml
+import pandas as pd
+import pickle
+import xgboost as xgb
+from datetime import datetime, timedelta
+from exchange.binance_connector import BinanceFuturesConnector
+from ta.trend import MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange, BollingerBands
+from sklearn.model_selection import train_test_split
+
+class ModelTrainer:
+    def __init__(self, config_path="config.yaml"):
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+
+        self.symbol     = cfg["symbol"]
+        self.timeframes = ["5m", "15m", "1h", "4h"]
+        self.tf_limits  = {
+            "5m": 100000,
+            "15m": 100000,
+            "1h": 10000,
+            "4h": 500,
+        }
+        self.model_dir  = cfg.get("model_dir", "models")
+        os.makedirs(self.model_dir, exist_ok=True)
+        self.connector  = BinanceFuturesConnector()
+
+    def fetch_data(self, tf):
+        limit = self.tf_limits.get(tf, 500)
+        df = self.connector.fetch_ohlcv(
+            symbol=self.symbol,
+            timeframe=tf,
+            limit=limit
+        )
+        df.columns = ["timestamp","open","high","low","close","volume"]
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        return df
+
+    def prepare_features(self, df):
+        df["ema_spread"] = df["close"].ewm(span=9).mean() - df["close"].ewm(span=21).mean()
+        df["rsi"]        = RSIIndicator(df["close"], window=14).rsi()
+        df["atr"]        = AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+        macd            = MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+        df["macd_hist"] = macd.macd_diff()
+        df["vol_ratio"] = df["volume"] / df["volume"].rolling(10).mean()
+        df["lag_return"]= df["close"].pct_change()
+        bb              = BollingerBands(df["close"], window=20, window_dev=2)
+        df["bb_bandwidth"] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
+
+        feature_cols = ["ema_spread","rsi","atr","macd_hist","vol_ratio","lag_return","bb_bandwidth"]
+        df = df.dropna(subset=feature_cols + ["close"])
+        X = df[feature_cols]
+        df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
+        return X.iloc[:-1], df["target"].iloc[:-1]
+
+    def train_timeframe(self, tf):
+        df = self.fetch_data(tf)
+        X, y = self.prepare_features(df)
+        if len(y) < 50:
+            print(f"[SKIP] Not enough data for {tf}: {len(y)} rows")
+            return
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+        model = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=4,
+            learning_rate=0.1,
+            use_label_encoder=False,
+            eval_metric="logloss"
+        )
+        model.fit(
+            X_train, y_train,
+            # eval_set=[(X_test, y_test)],
+            # early_stopping_rounds=10,
+            verbose=False
+        )
+        path = os.path.join(self.model_dir, f"model_{tf}.pkl")
+        with open(path, "wb") as f:
+            pickle.dump(model, f)
+        print(f"[SAVE] Model for {tf} → {path}")
+
+    def run_all(self):
+        for tf in self.timeframes:
+            try:
+                self.train_timeframe(tf)
+            except Exception as e:
+                print(f"[ERROR] {tf}: {e}")
+
+    def schedule_hourly(self):
+        self.run_all()
+        while True:
+            now = datetime.now()
+            next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            time.sleep((next_hour - now).total_seconds())
+            self.run_all()
+
+def start_background_training():
+    trainer = ModelTrainer()
+    # **run first training pass now, in main thread**
+    trainer.run_all()
+    # then schedule the hourly retrains in a daemon thread
+    t = threading.Thread(target=trainer.schedule_hourly, daemon=True)
+    t.start()
+
+if __name__ == "__main__":
+    start_background_training()
+    # keep process alive if run standalone
+    while True:
+        time.sleep(3600)
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\backtester\backtester.py
+===========================================
+
+# backtester/backtester.py
+
+import os
+import pandas as pd
+import ta
+import yaml
+from risk.risk_manager import RiskManager
+
+class Backtester:
+    def __init__(self, config_path="config.yaml"):
+        # load parameters
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+
+        self.initial_capital = float(cfg.get("initial_capital", 1000.0))
+        self.leverage        = int(cfg.get("leverage", 10))
+        self.risk_per_trade  = float(cfg.get("risk_per_trade", 0.01))
+
+        self.atr_window      = int(cfg.get("atr_window", 14))
+        self.atr_mult        = float(cfg.get("atr_multiplier", 1.5))
+        self.tp_mult         = float(cfg.get("tp_multiplier", 3.0))
+
+        # realistic backtest parameters
+        self.fee_rate        = float(cfg.get("taker_fee", 0.0004))
+        self.slippage        = float(cfg.get("slippage", 0.0005))
+
+        self.risk_manager    = RiskManager()
+
+    def run_backtest(self, df: pd.DataFrame, strategy):
+        df = df.copy()
+        # ensure timestamp column
+        if "timestamp" not in df.columns:
+            df = df.reset_index().rename(columns={"index": "timestamp"})
+
+        # generate signals
+        df = strategy.generate_signal(df)
+
+        # compute ATR
+        df["atr"] = ta.volatility.average_true_range(
+            df["high"], df["low"], df["close"], window=self.atr_window
+        )
+
+        # initial state
+        capital        = self.initial_capital
+        in_position    = False
+        entry_price    = entry_time = entry_atr = None
+        entry_size     = None
+        tp_price       = None
+        sl_price       = None
+        highest_price  = lowest_price = None
+        direction      = None
+
+        trades = []
+
+        # helper for previous signal and exit_signal
+        df["prev_sig"] = df["signal"].shift(1).fillna(0).astype(int)
+        exit_sig       = df.get("exit_signal", pd.Series(0, index=df.index)).astype(int)
+
+        for _, row in df.iterrows():
+            sig    = int(row["signal"])
+            prev   = int(row["prev_sig"])
+            ex_sig = int(exit_sig.loc[row.name])
+            price  = float(row["close"])
+            atr    = float(row["atr"])
+            h      = float(row["high"])
+            l      = float(row["low"])
+            ts     = row["timestamp"]
+
+            # ENTRY LONG
+            if not in_position and sig == 1 and prev != 1:
+                in_position   = True
+                direction     = "long"
+                entry_price   = price * (1 + self.slippage)
+                entry_time    = ts
+                entry_atr     = atr
+                sl_price      = entry_price - (atr * self.atr_mult)
+                tp_price      = entry_price + (atr * self.tp_mult)
+                highest_price = entry_price
+
+                # calculate size
+                stop_dist     = atr * self.atr_mult
+                entry_size    = self.risk_manager.calculate_position_size(
+                    balance=capital,
+                    price=entry_price,
+                    stop_loss=stop_dist,
+                    leverage=self.leverage,
+                    risk_percent=self.risk_per_trade
+                )
+                if entry_size <= 0:
+                    in_position = False
+                continue
+
+            # ENTRY SHORT
+            if not in_position and sig == -1 and prev != -1:
+                in_position   = True
+                direction     = "short"
+                entry_price   = price * (1 - self.slippage)
+                entry_time    = ts
+                entry_atr     = atr
+                sl_price      = entry_price + (atr * self.atr_mult)
+                tp_price      = entry_price - (atr * self.tp_mult)
+                lowest_price  = entry_price
+
+                stop_dist     = atr * self.atr_mult
+                entry_size    = self.risk_manager.calculate_position_size(
+                    balance=capital,
+                    price=entry_price,
+                    stop_loss=stop_dist,
+                    leverage=self.leverage,
+                    risk_percent=self.risk_per_trade
+                )
+                if entry_size <= 0:
+                    in_position = False
+                continue
+
+            # MANAGE POSITION
+            if in_position:
+                reason      = None
+                exit_price  = price  # default if exit later
+
+                if direction == "long":
+                    highest_price = max(highest_price, price)
+                    trail_price   = highest_price - (entry_atr * self.atr_mult)
+
+                    # check intra-bar stops/targets
+                    if l <= sl_price:
+                        reason     = "Ultimate SL"
+                        exit_price = sl_price * (1 - self.slippage)
+                    elif h >= tp_price:
+                        reason     = "Take Profit"
+                        exit_price = tp_price * (1 - self.slippage)
+                    elif l <= trail_price:
+                        reason     = "Trailing SL"
+                        exit_price = trail_price * (1 - self.slippage)
+                    elif ex_sig == 1:
+                        reason     = "Strategy Exit"
+                        exit_price = price * (1 - self.slippage)
+
+                else:  # short
+                    lowest_price = min(lowest_price, price)
+                    trail_price   = lowest_price + (entry_atr * self.atr_mult)
+
+                    if h >= sl_price:
+                        reason     = "Ultimate SL"
+                        exit_price = sl_price * (1 + self.slippage)
+                    elif l <= tp_price:
+                        reason     = "Take Profit"
+                        exit_price = tp_price * (1 + self.slippage)
+                    elif h >= trail_price:
+                        reason     = "Trailing SL"
+                        exit_price = trail_price * (1 + self.slippage)
+                    elif ex_sig == -1:
+                        reason     = "Strategy Exit"
+                        exit_price = price * (1 + self.slippage)
+
+                if reason:
+                    # compute P&L
+                    if direction == "long":
+                        gross = (exit_price - entry_price) * entry_size
+                    else:
+                        gross = (entry_price - exit_price) * entry_size
+
+                    fees = (entry_price + exit_price) * entry_size * self.fee_rate
+                    net  = gross - fees
+                    capital += net
+
+                    trades.append({
+                        "entry_time":  entry_time,
+                        "exit_time":   ts,
+                        "direction":   direction,
+                        "entry_price": round(entry_price, 5),
+                        "exit_price":  round(exit_price, 5),
+                        "size":        round(entry_size, 5),
+                        "gross_pnl":   round(gross, 5),
+                        "fees":        round(fees, 5),
+                        "net_pnl":     round(net, 5),
+                        "profit":      round(net, 5),
+                        "reason":      reason
+                    })
+
+                    # reset
+                    in_position   = False
+                    entry_price   = entry_time = entry_atr = None
+                    entry_size    = tp_price = sl_price = None
+                    highest_price = lowest_price = None
+                    direction     = None
+
+        return pd.DataFrame(trades), capital
+
+# Example usage:
+# backtester = Backtester()
+# trades_df, final_capital = backtester.run_backtest(df, strategy)
+
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\backtester\__init__.py
+=========================================
+
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\exchange\binance_connector.py
+================================================
+
+import ccxt
+import os
+from dotenv import load_dotenv
+import pandas as pd
+import time
+
+load_dotenv()
+
+# Global offset (in milliseconds)
+time_offset = 0
+
+class BinanceFuturesConnector:
+    def __init__(self):
+        global time_offset
+
+        self.exchange = ccxt.binance({
+            'apiKey': os.getenv("BINANCE_API_KEY"),
+            'secret': os.getenv("BINANCE_SECRET_KEY"),
+            'options': {
+                'defaultType': 'future',
+                'recvWindow': 10000  # Increase recvWindow to tolerate delays
+            },
+            'enableRateLimit': True,
+        })
+
+        # Fetch Binance server time once at start
+        try:
+            server_time = self.exchange.fetch_time()
+            local_time = int(time.time() * 1000)  # in ms
+            time_offset = server_time - local_time
+            print(f"[INFO] Adjusted timestamp by {time_offset}ms")
+        except Exception as e:
+            print("[ERROR] Could not fetch server time:", e)
+
+    def fetch_ohlcv(self, symbol="PIXEL/USDT", timeframe="5m", limit=100):
+        ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+
+    def create_market_buy_order(self, symbol, size):
+        params = {'timestamp': self.get_synced_timestamp()}
+        order = self.exchange.create_order(
+            symbol=symbol,
+            type='market',
+            side='buy',
+            amount=size,
+            price=None,
+            params=params
+        )
+        return order
+
+    def create_market_sell_order(self, symbol, size):
+        params = {'timestamp': self.get_synced_timestamp()}
+        order = self.exchange.create_order(
+            symbol=symbol,
+            type='market',
+            side='sell',
+            amount=size,
+            price=None,
+            params=params
+        )
+        return order
+
+    def get_synced_timestamp(self):
+        global time_offset
+        return int((time.time() * 1000) + time_offset)
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\exchange\__init__.py
+=======================================
+
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\gui\backtest_view.py
+=======================================
+
+# gui/backtest_view.py
+
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QTextEdit, QLabel, QComboBox
+from exchange.binance_connector import BinanceFuturesConnector
+from strategies.strategy_manager import StrategyManager
+from utils.report_exporter import ReportExporter
+from backtester.backtester import Backtester
+from utils.performance_analyzer import PerformanceAnalyzer
+import threading
+import pandas as pd
+
+class BacktestView(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.layout = QVBoxLayout()
+        self.select_label      = QLabel("Select Strategy:")
+        self.strategy_selector = QComboBox()
+# in Dashboard.__init__ after creating self.strategy_selector:
+        self.strategy_selector.addItems([
+            "EMA Crossover",
+            "RSI Divergence",
+            "Bollinger Breakout",
+            "MACD Crossover",
+            "SMA Crossover",
+            "RSI+MACD Combo",
+            "Donchian Breakout",
+            "BB+RSI Combo",
+            "MultiEMA Stochastic",
+            "VWAP Reversion",
+            "Ichimoku Breakout",
+            "Supertrend RSI",
+            "MACD Volume Surge",
+            "Keltner CCI Mean Reversion",
+            "Turtle Three Screen",
+            "Pivot Point Breakout",
+            "ADX Bollinger Squeeze",
+            "RSI MA Envelope",
+            "Machine Learning Signal",
+            "Pairs Trading"
+        ])
+
+        self.backtest_button   = QPushButton("Run Strategy Backtest")
+        self.output            = QTextEdit()
+        self.output.setReadOnly(True)
+
+        self.layout.addWidget(self.select_label)
+        self.layout.addWidget(self.strategy_selector)
+        self.layout.addWidget(self.backtest_button)
+        self.layout.addWidget(self.output)
+        self.setLayout(self.layout)
+
+        self.backtest_button.clicked.connect(self.run_backtest)
+
+    def run_backtest(self):
+        self.backtest_button.setEnabled(False)
+        strat = self.strategy_selector.currentText()
+        self.output.append(f"[INFO] Running backtest for: {strat}\n")
+        threading.Thread(target=self._worker, args=(strat,), daemon=True).start()
+
+    def _worker(self, strategy_name):
+        try:
+            # 1) fetch data (spot or futures as you prefer)
+            conn = BinanceFuturesConnector()
+            df   = conn.fetch_ohlcv(symbol="TAO/USDT", timeframe="4h", limit=200)
+            df.columns = ["timestamp","open","high","low","close","volume"]  # ensure names
+
+            # 2) pick strategy
+            strat = StrategyManager().get_strategy(strategy_name)
+            if not strat:
+                raise ValueError(f"Strategy '{strategy_name}' not found.")
+
+            # 3) backtest
+            backtester = Backtester()
+            trades_df, final_cap = backtester.run_backtest(df, strat)
+            ReportExporter().export_to_csv(trades_df, filename="data/backtest_trades.csv")
+
+
+            # 4) display
+            if trades_df.empty:
+                self.output.append("[INFO] No trades generated during backtest.\n")
+            else:
+                # show final capital to 5 decimal places
+                self.output.append(f"[RESULT] Final Capital: ${final_cap:.5f}\n")
+
+                # performance summary
+                analyzer = PerformanceAnalyzer()
+                stats = analyzer.analyze_trades(trades_df)
+                # print each stat on its own line
+                for k, v in stats.items():
+                    self.output.append(f"{k}: {v}")
+                self.output.append("")  # blank line
+
+        except Exception as e:
+            self.output.append(f"[ERROR] {e}\n")
+        finally:
+            self.backtest_button.setEnabled(True)
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\gui\dashboard.py
+===================================
+
+import os
+import time
+import threading
+import yaml
+import pandas as pd
+import ta
+import ccxt
+
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QComboBox
+from PyQt6.QtCore    import pyqtSignal
+
+from ta.trend                    import ADXIndicator, SMAIndicator
+from exchange.binance_connector  import BinanceFuturesConnector
+from strategies.strategy_manager import StrategyManager
+from risk.risk_manager           import RiskManager
+from utils.retry                 import retry
+from utils.config                import Config
+
+# Optional Telegram alerts
+try:
+    from utils.helpers import send_telegram_message
+except ImportError:
+    def send_telegram_message(msg):
+        print("[TELEGRAM DISABLED]", msg)
+
+
+class Dashboard(QWidget):
+    log_signal = pyqtSignal(str)
+
+    def __init__(self, log_callback=None):
+        super().__init__()
+        self.log_callback = log_callback
+
+        # Load & validate config
+        cfg_path = "config.yaml"
+        if not os.path.exists(cfg_path):
+            raise FileNotFoundError(f"Missing config file: {cfg_path}")
+        with open(cfg_path, "r") as f:
+            cfg_dict = yaml.safe_load(f)
+        self.cfg = Config(**cfg_dict)
+
+        # Core settings
+        self.symbol        = self.cfg.symbol
+        self.timeframe     = self.cfg.timeframe
+        self.limit         = self.cfg.limit
+        self.poll_interval = self.cfg.poll_interval
+
+        # Capital & risk
+        self.initial_capital = self.cfg.initial_capital
+        self.capital         = self.initial_capital
+        self.leverage        = self.cfg.leverage
+        self.risk_per_trade  = self.cfg.risk_per_trade
+
+        # ATR / SL / TP
+        self.atr_window              = self.cfg.atr_window
+        self.sl_atr_mult             = self.cfg.atr_multiplier
+        self.tp_atr_mult             = self.cfg.tp_multiplier
+        self.trailing_atr_multiplier = self.cfg.trailing_atr_multiplier
+
+        # Trend filter
+        self.adx_window    = self.cfg.adx_window
+        self.adx_threshold = self.cfg.adx_threshold
+        self.ma_period     = self.cfg.ma_period
+
+        # Time‐stop
+        self.max_holding_bars = self.cfg.max_holding_bars
+
+        # Fees & mode
+        self.fee_rate       = self.cfg.taker_fee
+        self.paper_mode     = self.cfg.paper_mode
+        self.trade_log_file = self.cfg.trade_log_file
+
+        # Managers & connectors
+        self.connector    = BinanceFuturesConnector()
+        self.risk_manager = RiskManager()
+        self.strategy_mgr = StrategyManager()
+
+        # In‐trade state
+        self._reset_trade_state()
+
+        # Build UI
+        self._build_ui()
+
+        # Hook up logging
+        self.log_signal.connect(self._append_log)
+
+
+    def _build_ui(self):
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Symbol:"))
+        self.sym_box = QComboBox()
+        self.sym_box.addItem(self.symbol)
+        layout.addWidget(self.sym_box)
+
+        layout.addWidget(QLabel("Strategy:"))
+        self.strat_box = QComboBox()
+        self.strat_box.addItems(list(self.strategy_mgr.strategy_map.keys()))
+        layout.addWidget(self.strat_box)
+
+        self.run_btn = QPushButton("Run Live Bot")
+        self.run_btn.clicked.connect(self.start_live)
+        layout.addWidget(self.run_btn)
+
+        self.setLayout(layout)
+
+
+    def _reset_trade_state(self):
+        self.in_position    = False
+        self.position_type  = None
+        self.entry_price    = None
+        self.entry_atr      = None
+        self.entry_size     = None
+        self.sl_price       = None
+        self.tp_price       = None
+        self.highest_price  = None
+        self.lowest_price   = None
+        self.trailing_dist  = None
+        self.entry_bar_idx  = None
+
+
+    def _append_log(self, msg: str):
+        if self.log_callback:
+            self.log_callback(msg)
+        else:
+            print(msg)
+
+
+    def log(self, msg: str):
+        self.log_signal.emit(msg)
+
+
+    @retry((ccxt.NetworkError, ccxt.ExchangeError, ConnectionError), tries=5, delay=1, backoff=2)
+    def fetch_candles(self, symbol, timeframe, limit):
+        return self.connector.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
+
+    @retry((ccxt.NetworkError, ccxt.ExchangeError, ConnectionError), tries=3, delay=1)
+    def fetch_balance(self):
+        return self.connector.exchange.fetch_balance()
+
+    @retry((ccxt.NetworkError, ccxt.ExchangeError, ConnectionError), tries=3, delay=1)
+    def place_buy(self, symbol, size):
+        return self.connector.exchange.create_market_buy_order(symbol, size)
+
+    @retry((ccxt.NetworkError, ccxt.ExchangeError, ConnectionError), tries=3, delay=1)
+    def place_sell(self, symbol, size, params=None):
+        return self.connector.exchange.create_market_sell_order(symbol, size, params or {})
+
+
+    def start_live(self):
+        symbol = self.sym_box.currentText()
+        strat  = self.strat_box.currentText()
+        self.log(f"[INFO] Starting live bot: {symbol} | Strategy={strat}")
+        threading.Thread(
+            target=self._live_loop,
+            args=(symbol, strat),
+            daemon=True
+        ).start()
+
+
+    def _live_loop(self, symbol, strategy_name):
+        strategy = self.strategy_mgr.get_strategy(strategy_name)
+        if not strategy:
+            self.log(f"[ERROR] Unknown strategy: {strategy_name}")
+            return
+
+        while True:
+            try:
+                # Fetch candles
+                df = self.fetch_candles(symbol, self.timeframe, self.limit)
+                df.columns = ["timestamp","open","high","low","close","volume"]
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+
+                # Generate signals
+                sig_df = strategy.generate_signal(df.copy())
+                latest = sig_df.iloc[-1]
+                signal = int(latest["signal"])
+                exit_sig = int(latest.get("exit_signal", 0))
+                price = float(latest["close"])
+
+                # ATR
+                sig_df["atr"] = ta.volatility.average_true_range(
+                    sig_df["high"], sig_df["low"], sig_df["close"],
+                    window=self.atr_window
+                )
+                atr = float(sig_df["atr"].dropna().iloc[-1])
+                self.log(f"[DEBUG] ATR={atr:.5f}")
+
+                # 1) derive stop‐loss distance from ATR
+                stop_loss_distance = atr * self.sl_atr_mult
+                self.log(f"[DEBUG] stop_loss_distance={stop_loss_distance:.5f}")
+
+                # 2) ask RiskManager for size
+                balance = self.capital if self.paper_mode \
+                    else float(self.fetch_balance()["total"]["USDT"])
+                size = self.risk_manager.calculate_position_size(
+                    balance=balance,
+                    stop_loss_distance=stop_loss_distance,
+                    leverage=self.leverage,
+                    risk_percent=self.risk_per_trade
+                )
+                self.log(f"[DEBUG] Position size = {size:.5f} contracts")
+
+                # … then proceed with entry logic …
+
+
+                # Trend filter
+                adx_vals = ADXIndicator(
+                    sig_df["high"], sig_df["low"], sig_df["close"],
+                    window=self.adx_window
+                ).adx()
+                ma_vals = SMAIndicator(sig_df["close"], window=self.ma_period).sma_indicator()
+                adx_val, ma_val = float(adx_vals.iloc[-1]), float(ma_vals.iloc[-1])
+                self.log(f"[DEBUG] ADX={adx_val:.2f} MA{self.ma_period}={ma_val:.5f}")
+
+                # Position sizing
+                bal = self.capital if self.paper_mode else float(self.fetch_balance()["total"]["USDT"])
+                stop_dist = atr * self.sl_atr_mult
+                size = self.risk_manager.calculate_position_size(
+                    balance=bal,
+                    price=price,
+                    stop_loss=stop_dist,
+                    leverage=self.leverage,
+                    risk_percent=self.risk_per_trade
+                )
+                self.log(f"[DEBUG] Sig={signal} ExitSig={exit_sig} Size={size:.5f}")
+
+                # Trend-filtered entry
+                if not self.in_position:
+                    if signal == 1 and (adx_val < self.adx_threshold or price < ma_val):
+                        self.log("[DEBUG] LONG filtered out by ADX/MA")
+                        signal = 0
+                    if signal == -1 and (adx_val < self.adx_threshold or price > ma_val):
+                        self.log("[DEBUG] SHORT filtered out by ADX/MA")
+                        signal = 0
+
+                # Strategy-based exit
+                if self.in_position and exit_sig != 0:
+                    self.log(f"[DEBUG] Strategy exit {self.position_type.upper()} @ {price:.5f}")
+                    self._exit_position(symbol, price, "Strategy Exit")
+                    time.sleep(self.poll_interval)
+                    continue
+
+                # Entry logic
+                if not self.in_position and signal == 1:
+                    self._enter_long(symbol, price, atr, size, len(sig_df)-1)
+                elif not self.in_position and signal == -1:
+                    self._enter_short(symbol, price, atr, size, len(sig_df)-1)
+
+                # Time-stop
+                if self.in_position:
+                    held = (len(sig_df)-1) - self.entry_bar_idx
+                    if held >= self.max_holding_bars:
+                        self.log(f"[TIME STOP] Held {held} bars; exiting {self.position_type}")
+                        self._exit_position(symbol, price, "Time Stop")
+                        time.sleep(self.poll_interval)
+                        continue
+
+                # ATR & trailing exits
+                if self.in_position:
+                    self._check_atr_exits(symbol, price)
+
+                time.sleep(self.poll_interval)
+
+            except Exception as e:
+                self.log(f"[ERROR] Live loop iteration failed: {e}")
+                time.sleep(self.poll_interval)
+
+
+    def _enter_long(self, sym, price, atr, size, current_idx):
+        if self.paper_mode:
+            self.log(f"[PAPER] BUY  {sym} size={size:.5f}")
+        else:
+            self.place_buy(sym, size)
+            self.log(f"[LIVE] BUY  {sym} size={size:.5f}")
+
+        self.in_position    = True
+        self.position_type  = "long"
+        self.entry_price    = price
+        self.entry_atr      = atr
+        self.entry_size     = size
+        self.sl_price       = price - (atr * self.sl_atr_mult)
+        self.tp_price       = price + (atr * self.tp_atr_mult)
+        self.highest_price  = price
+        self.entry_bar_idx  = current_idx
+        self.trailing_dist  = atr * self.trailing_atr_multiplier
+
+        self.log(f"[LONG] Open @ {price:.5f} | SL={self.sl_price:.5f} TP={self.tp_price:.5f} TrailDist={self.trailing_dist:.5f}")
+
+
+    def _enter_short(self, sym, price, atr, size, current_idx):
+        if self.paper_mode:
+            self.log(f"[PAPER] SELL {sym} size={size:.5f}")
+        else:
+            self.place_sell(sym, size)
+            self.log(f"[LIVE] SELL {sym} size={size:.5f}")
+
+        self.in_position    = True
+        self.position_type  = "short"
+        self.entry_price    = price
+        self.entry_atr      = atr
+        self.entry_size     = size
+        self.sl_price       = price + (atr * self.sl_atr_mult)
+        self.tp_price       = price - (atr * self.tp_atr_mult)
+        self.lowest_price   = price
+        self.entry_bar_idx  = current_idx
+        self.trailing_dist  = atr * self.trailing_atr_multiplier
+
+        self.log(f"[SHORT] Open @ {price:.5f} | SL={self.sl_price:.5f} TP={self.tp_price:.5f} TrailDist={self.trailing_dist:.5f}")
+
+
+    def _check_atr_exits(self, sym, price):
+        if self.position_type == "long":
+            self.highest_price = max(self.highest_price, price)
+            trail_stop = self.highest_price - self.trailing_dist
+            self.log(f"[DEBUG] Price={price:.5f} ULT={self.sl_price:.5f} TP={self.tp_price:.5f} TRL={trail_stop:.5f}")
+            if price <= self.sl_price:
+                self._exit_position(sym, price, "Ultimate SL")
+            elif price >= self.tp_price:
+                self._exit_position(sym, price, "Take Profit")
+            elif price <= trail_stop:
+                self._exit_position(sym, price, "Trailing SL")
+        else:
+            self.lowest_price = min(self.lowest_price, price)
+            trail_stop = self.lowest_price + self.trailing_dist
+            self.log(f"[DEBUG] Price={price:.5f} ULT={self.sl_price:.5f} TP={self.tp_price:.5f} TRL={trail_stop:.5f}")
+            if price >= self.sl_price:
+                self._exit_position(sym, price, "Ultimate SL")
+            elif price <= self.tp_price:
+                self._exit_position(sym, price, "Take Profit")
+            elif price >= trail_stop:
+                self._exit_position(sym, price, "Trailing SL")
+
+
+    def _exit_position(self, sym, exit_price, reason):
+        size = self.entry_size
+        if self.position_type == "long":
+            gross = (exit_price - self.entry_price) * size
+        else:
+            gross = (self.entry_price - exit_price) * size
+        fees = (self.entry_price + exit_price) * size * self.fee_rate
+        net  = gross - fees
+        self.capital += net
+
+        if not self.paper_mode:
+            if self.position_type == "long":
+                self.place_sell(sym, size)
+            else:
+                self.place_buy(sym, size)
+
+        msg = (f"[CLOSE] {self.position_type.upper()} @ {exit_price:.5f} "
+               f"Gross={gross:.5f} Fees={fees:.5f} Net={net:.5f} "
+               f"Capital={self.capital:.5f} Reason={reason}")
+        self.log(msg)
+        send_telegram_message(msg)
+
+        self._save_trade({
+            "timestamp":   pd.Timestamp.now(),
+            "type":        self.position_type,
+            "entry_price": self.entry_price,
+            "exit_price":  exit_price,
+            "size":        size,
+            "gross":       gross,
+            "fees":        fees,
+            "net":         net,
+            "reason":      reason
+        })
+        self._reset_trade_state()
+
+
+    def _save_trade(self, data: dict):
+        import csv
+        os.makedirs(os.path.dirname(self.trade_log_file), exist_ok=True)
+        write_header = not os.path.exists(self.trade_log_file)
+        with open(self.trade_log_file, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(data.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(data)
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\gui\logs_view.py
+===================================
+
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTextEdit
+
+
+class LogsView(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout()
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        layout.addWidget(self.log_output)
+        self.setLayout(layout)
+
+    def update_log(self, message):
+        self.log_output.append(message)
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\gui\main_window.py
+=====================================
+
+from PyQt6.QtWidgets import QApplication, QMainWindow, QTabWidget
+from gui.dashboard import Dashboard
+from gui.backtest_view import BacktestView
+from gui.logs_view import LogsView
+from gui.strategy_form import StrategyForm
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Quantum Trader Pro")
+        self.setGeometry(100, 100, 1200, 800)
+
+        self.logs_view = LogsView()  # Initialize once for shared access
+
+        tabs = QTabWidget()
+        tabs.addTab(Dashboard(log_callback=self.logs_view.update_log), "Dashboard")
+        tabs.addTab(BacktestView(), "Backtester")
+        tabs.addTab(self.logs_view, "Trade Log")
+        tabs.addTab(StrategyForm(), "Custom Strategy")
+
+        self.setCentralWidget(tabs)
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\gui\strategy_form.py
+=======================================
+
+
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton
+
+class StrategyForm(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Custom Strategy Name"))
+        self.name_input = QLineEdit()
+        layout.addWidget(self.name_input)
+        layout.addWidget(QLabel("Condition (e.g., ema_short > ema_long)"))
+        self.condition_input = QLineEdit()
+        layout.addWidget(self.condition_input)
+        self.save_button = QPushButton("Save Strategy")
+        layout.addWidget(self.save_button)
+        self.setLayout(layout)
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\gui\__init__.py
+==================================
+
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\risk\risk_manager.py
+=======================================
+
+# risk/risk_manager.py
+
+import math
+
+class RiskManager:
+    def calculate_position_size(
+        self,
+        balance: float,
+        price: float,
+        stop_loss: float,
+        leverage: int = 1,
+        risk_percent: float = 0.01
+    ) -> float:
+        """
+        balance         : account equity in quote currency (e.g. USDT)
+        price           : current symbol price
+        stop_loss       : absolute price distance to stop (e.g. ATR * multiplier)
+        leverage        : contract leverage
+        risk_percent    : fraction of balance to risk (e.g. 0.01 → 1%)
+        """
+        # 1) sanity checks
+        if stop_loss <= 0 or price <= 0 or not math.isfinite(stop_loss) or not math.isfinite(price):
+            return 0.0
+
+        # 2) $ amount you risk if stop is hit
+        risk_amount = balance * risk_percent
+
+        # 3) contracts = risk_amount / (stop_loss * price) 
+        contracts = risk_amount / (stop_loss * price)
+
+        # 4) apply leverage
+        return contracts * leverage
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\risk\__init__.py
+===================================
+
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\adx_bollinger_squeeze.py
+======================================================
+
+from ta.volatility import BollingerBands
+from ta.trend import ADXIndicator
+
+class ADXBollingerSqueezeStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        bb = BollingerBands(df['close'], window=20, window_dev=2)
+        df['bandwidth'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
+        df['adx'] = ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
+        
+        df['signal'] = 0
+        df.loc[(df['bandwidth'] < 0.05) & (df['adx'] > 25), 'signal'] = 1
+        df.loc[(df['bandwidth'] < 0.05) & (df['adx'] > 25), 'signal'] = -1  # adapt for short if needed
+        
+        df['exit_signal'] = 0
+        df.loc[df['adx'] < 20, 'exit_signal'] = df['signal'].shift(1)
+        
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\bb_rsi_combo.py
+=============================================
+
+from ta.volatility import BollingerBands
+from ta.momentum import RSIIndicator
+
+class BBRSIComboStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        bb  = BollingerBands(close=df["close"], window=20, window_dev=2)
+        df["bb_upper"] = bb.bollinger_hband()
+        df["bb_lower"] = bb.bollinger_lband()
+        df["bb_mid"]   = bb.bollinger_mavg()
+        df["rsi"]      = RSIIndicator(df["close"], window=14).rsi()
+
+        # Entry: break band with RSI confirmation
+        df["signal"] = 0
+        df.loc[
+            (df["close"] > df["bb_upper"]) & (df["rsi"] < 70),
+            "signal"
+        ] = 1
+        df.loc[
+            (df["close"] < df["bb_lower"]) & (df["rsi"] > 30),
+            "signal"
+        ] = -1
+
+        # Exit: reversion to mid-band or RSI cross
+        df["exit_signal"] = 0
+        df.loc[
+            (df["signal"].shift(1) == 1) & (
+                (df["close"] < df["bb_mid"]) | (df["rsi"] > 50)
+            ),
+            "exit_signal"
+        ] = 1
+        df.loc[
+            (df["signal"].shift(1) == -1) & (
+                (df["close"] > df["bb_mid"]) | (df["rsi"] < 50)
+            ),
+            "exit_signal"
+        ] = -1
+
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\bollinger_breakout.py
+===================================================
+
+from ta.volatility import BollingerBands
+
+class BollingerBreakoutStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        bb = BollingerBands(close=df["close"], window=20, window_dev=2)
+        df["bb_upper"] = bb.bollinger_hband()
+        df["bb_lower"] = bb.bollinger_lband()
+        df["bb_mid"]   = bb.bollinger_mavg()
+
+        # Entry signals
+        df["signal"] = 0
+        df.loc[df["close"] > df["bb_upper"], "signal"] = 1
+        df.loc[df["close"] < df["bb_lower"], "signal"] = -1
+
+        # Exit signals
+        df["exit_signal"] = 0
+        # if we were long and price < middle → exit long
+        df.loc[
+            (df["signal"].shift(1) == 1) &
+            (df["close"] < df["bb_mid"]),
+            "exit_signal"
+        ] = 1
+        # if we were short and price > middle → exit short
+        df.loc[
+            (df["signal"].shift(1) == -1) &
+            (df["close"] > df["bb_mid"]),
+            "exit_signal"
+        ] = -1
+
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\donchian_breakout.py
+==================================================
+
+from ta.volatility import DonchianChannel
+
+class DonchianBreakoutStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        dc = DonchianChannel(high=df["high"], low=df["low"], window=20)
+        df["dc_upper"] = dc.donchian_channel_hband()
+        df["dc_lower"] = dc.donchian_channel_lband()
+
+        # Entry
+        df["signal"] = 0
+        df.loc[df["close"] > df["dc_upper"], "signal"] = 1
+        df.loc[df["close"] < df["dc_lower"], "signal"] = -1
+
+        # Exit on reversion into the channel
+        df["exit_signal"] = 0
+        df.loc[
+            (df["signal"].shift(1) == 1) & (df["close"] < df["dc_upper"]),
+            "exit_signal"
+        ] = 1
+        df.loc[
+            (df["signal"].shift(1) == -1) & (df["close"] > df["dc_lower"]),
+            "exit_signal"
+        ] = -1
+
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\ema_crossover.py
+==============================================
+
+from ta.trend import ema_indicator
+
+class EMACrossoverStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        df['ema_short'] = ema_indicator(df['close'], window=9)
+        df['ema_long']  = ema_indicator(df['close'], window=21)
+
+        # Entry
+        df['signal'] = 0
+        df.loc[df['ema_short'] > df['ema_long'], 'signal'] = 1
+        df.loc[df['ema_short'] < df['ema_long'], 'signal'] = -1
+
+        # Exit
+        df['exit_signal'] = 0
+        # previously long but now short → close long
+        df.loc[
+            (df['signal'].shift(1) == 1) &
+            (df['ema_short'] < df['ema_long']),
+            'exit_signal'
+        ] = 1
+        # previously short but now long → close short
+        df.loc[
+            (df['signal'].shift(1) == -1) &
+            (df['ema_short'] > df['ema_long']),
+            'exit_signal'
+        ] = -1
+
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\ichimoku_breakout.py
+==================================================
+
+from ta.trend import IchimokuIndicator
+
+class IchimokuBreakoutStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        ich = IchimokuIndicator(high=df['high'], low=df['low'], window1=9, window2=26, window3=52)
+        df['conversion'] = ich.ichimoku_conversion_line()
+        df['base']       = ich.ichimoku_base_line()
+        
+        # Entry: price above cloud and conversion > base
+        df['signal'] = 0
+        df.loc[(df['close'] > ich.ichimoku_a()) & (df['conversion'] > df['base']), 'signal'] = 1
+        df.loc[(df['close'] < ich.ichimoku_b()) & (df['conversion'] < df['base']), 'signal'] = -1
+        
+        df['exit_signal'] = 0
+        df.loc[(df['signal'].shift(1) == 1) & (df['conversion'] < df['base']), 'exit_signal'] = 1
+        df.loc[(df['signal'].shift(1) == -1) & (df['conversion'] > df['base']), 'exit_signal'] = -1
+        
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\keltner_cci_mean_reversion.py
+===========================================================
+
+# strategies/keltner_cci_mean_reversion.py
+
+from ta.volatility import KeltnerChannel
+from ta.trend import CCIIndicator
+
+class KeltnerCCIMeanReversionStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        # Keltner Channel
+        kc = KeltnerChannel(
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            window=20,
+            window_atr=10
+        )
+        df['kc_lower'] = kc.keltner_channel_lband()
+        df['kc_upper'] = kc.keltner_channel_hband()
+
+        # CCI
+        df['cci'] = CCIIndicator(
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            window=20
+        ).cci()
+
+        # Entry: price outside channel and CCI extreme
+        df['signal'] = 0
+        df.loc[(df['close'] < df['kc_lower']) & (df['cci'] < -100), 'signal'] = 1
+        df.loc[(df['close'] > df['kc_upper']) & (df['cci'] > 100),  'signal'] = -1
+
+        # Exit: CCI mean‐reversion
+        df['exit_signal'] = 0
+        df.loc[
+            (df['signal'].shift(1) == 1) & (df['cci'] > 0),
+            'exit_signal'
+        ] = 1
+        df.loc[
+            (df['signal'].shift(1) == -1) & (df['cci'] < 0),
+            'exit_signal'
+        ] = -1
+
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\macd_crossover.py
+===============================================
+
+from ta.trend import MACD
+
+class MACDCrossoverStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        macd = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
+        df["macd"]        = macd.macd()
+        df["macd_signal"] = macd.macd_signal()
+
+        # Entry
+        df["signal"] = 0
+        df.loc[df["macd"] > df["macd_signal"], "signal"] = 1
+        df.loc[df["macd"] < df["macd_signal"], "signal"] = -1
+
+        # Exit on cross back
+        df["exit_signal"] = 0
+        df.loc[
+            (df["signal"].shift(1) == 1) &
+            (df["macd"] < df["macd_signal"]),
+            "exit_signal"
+        ] = 1
+        df.loc[
+            (df["signal"].shift(1) == -1) &
+            (df["macd"] > df["macd_signal"]),
+            "exit_signal"
+        ] = -1
+
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\macd_volume_surge.py
+==================================================
+
+from ta.trend import MACD
+from ta.volume import VolumeWeightedAveragePrice
+
+class MACDVolumeSurgeStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        macd = MACD(close=df['close'], window_slow=26, window_fast=12, window_sign=9)
+        df['macd_hist'] = macd.macd_diff()
+        df['vwap'] = VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['volume'], window=20).volume_weighted_average_price()
+        
+        df['signal'] = 0
+        df.loc[(df['macd_hist'] > 0) & (df['volume'] > df['volume'].rolling(20).mean()*2), 'signal'] = 1
+        df.loc[(df['macd_hist'] < 0) & (df['volume'] > df['volume'].rolling(20).mean()*2), 'signal'] = -1
+        
+        df['exit_signal'] = 0
+        df.loc[(df['signal'].shift(1) == 1) & (df['macd_hist'] < 0), 'exit_signal'] = 1
+        df.loc[(df['signal'].shift(1) == -1) & (df['macd_hist'] > 0), 'exit_signal'] = -1
+        
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\ml_signal.py
+==========================================
+
+# strategies/ml_signal.py
+
+import os
+import yaml
+import pickle
+import pandas as pd
+from ta.trend import MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange, BollingerBands
+
+class MachineLearningSignalStrategy:
+    def __init__(self):
+        with open("config.yaml", "r") as f:
+            cfg = yaml.safe_load(f)
+        tf = cfg["timeframe"]
+        model_dir = cfg.get("model_dir", "models")
+        model_path = os.path.join(model_dir, f"model_{tf}.pkl")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"ML model for {tf} not found: {model_path}")
+        with open(model_path, "rb") as f:
+            self.model = pickle.load(f)
+        self.features = [
+            "ema_spread","rsi","atr","macd_hist",
+            "vol_ratio","lag_return","bb_bandwidth"
+        ]
+
+    def generate_signal(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df["ema_spread"] = df["close"].ewm(span=9).mean() - df["close"].ewm(span=21).mean()
+        df["rsi"]        = RSIIndicator(df["close"], window=14).rsi()
+        df["atr"]        = AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+        macd            = MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+        df["macd_hist"] = macd.macd_diff()
+        df["vol_ratio"] = df["volume"] / df["volume"].rolling(10).mean()
+        df["lag_return"]= df["close"].pct_change()
+        bb              = BollingerBands(df["close"], window=20, window_dev=2)
+        df["bb_bandwidth"] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
+
+        df = df.dropna(subset=self.features)
+        X = df[self.features]
+        preds = self.model.predict(X)
+        df["signal"] = pd.Series(preds, index=X.index).map({1:1, 0:-1})
+        df["exit_signal"] = 0
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\multi_ema_stochastic.py
+=====================================================
+
+from ta.trend import EMAIndicator
+from ta.momentum import StochasticOscillator
+
+class MultiEMAStochasticStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        # EMA Trend
+        df['ema_short'] = EMAIndicator(df['close'], window=20).ema_indicator()
+        df['ema_long']  = EMAIndicator(df['close'], window=50).ema_indicator()
+        # Stochastic Oscillator
+        stoch = StochasticOscillator(df['high'], df['low'], df['close'], window=14, smooth_window=3)
+        df['stoch'] = stoch.stoch()
+        
+        # Entry: EMAs bullish and Stoch oversold
+        df['signal'] = 0
+        df.loc[(df['ema_short'] > df['ema_long']) & (df['stoch'] < 20), 'signal'] = 1
+        df.loc[(df['ema_short'] < df['ema_long']) & (df['stoch'] > 80), 'signal'] = -1
+        
+        # Exit: EMA cross or Stoch mid-cross
+        df['exit_signal'] = 0
+        df.loc[(df['signal'].shift(1) == 1) & (df['stoch'] > 50), 'exit_signal'] = 1
+        df.loc[(df['signal'].shift(1) == -1) & (df['stoch'] < 50), 'exit_signal'] = -1
+        
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\pairs_trading.py
+==============================================
+
+import pandas as pd
+
+class PairsTradingStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        # TODO: implement cointegration test & z-score of spread
+        df['signal'] = 0
+        df['exit_signal'] = 0
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\pivot_point_breakout.py
+=====================================================
+
+# Requires pivot point calculation library or custom implementation
+import pandas as pd
+
+def calculate_pivots(df):
+    # Basic pivot point calculation
+    df['pp'] = (df['high'] + df['low'] + df['close']) / 3
+    df['r1'] = 2 * df['pp'] - df['low']
+    df['s1'] = 2 * df['pp'] - df['high']
+    return df
+
+class PivotPointBreakoutStrategy:
+    def generate_signal(self, df):
+        df = calculate_pivots(df.copy())
+        df['signal'] = 0
+        df.loc[df['close'] > df['r1'], 'signal'] = 1
+        df.loc[df['close'] < df['s1'], 'signal'] = -1
+        
+        df['exit_signal'] = 0
+        df.loc[(df['signal'].shift(1) == 1) & (df['close'] < df['pp']), 'exit_signal'] = 1
+        df.loc[(df['signal'].shift(1) == -1) & (df['close'] > df['pp']), 'exit_signal'] = -1
+        
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\rsi_divergence.py
+===============================================
+
+from ta.momentum import rsi
+
+class RSIDivergenceStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        df['rsi'] = rsi(df['close'], window=14)
+
+        # Entry
+        df['signal'] = 0
+        df.loc[df['rsi'] < 30, 'signal'] = 1
+        df.loc[df['rsi'] > 70, 'signal'] = -1
+
+        # Exit
+        df['exit_signal'] = 0
+        # previously long and now RSI > 50 → exit long
+        df.loc[
+            (df['signal'].shift(1) == 1) &
+            (df['rsi'] > 50),
+            'exit_signal'
+        ] = 1
+        # previously short and now RSI < 50 → exit short
+        df.loc[
+            (df['signal'].shift(1) == -1) &
+            (df['rsi'] < 50),
+            'exit_signal'
+        ] = -1
+
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\rsi_macd_combo.py
+===============================================
+
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
+
+class RSIMACDComboStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        # MACD
+        macd = MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+        df["macd"]        = macd.macd()
+        df["macd_signal"] = macd.macd_signal()
+        # RSI
+        df["rsi"] = RSIIndicator(df["close"], window=14).rsi()
+
+        # Entry: require MACD cross plus RSI not overbought/oversold
+        df["signal"] = 0
+        df.loc[
+            (df["macd"] > df["macd_signal"]) & (df["rsi"] < 70),
+            "signal"
+        ] = 1
+        df.loc[
+            (df["macd"] < df["macd_signal"]) & (df["rsi"] > 30),
+            "signal"
+        ] = -1
+
+        # Exit: either opposite MACD cross or RSI crossing the midpoint
+        df["exit_signal"] = 0
+        df.loc[
+            (df["signal"].shift(1) == 1) &
+            ((df["macd"] < df["macd_signal"]) | (df["rsi"] > 50)),
+            "exit_signal"
+        ] = 1
+        df.loc[
+            (df["signal"].shift(1) == -1) &
+            ((df["macd"] > df["macd_signal"]) | (df["rsi"] < 50)),
+            "exit_signal"
+        ] = -1
+
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\rsi_ma_envelope.py
+================================================
+
+from ta.momentum import RSIIndicator
+from ta.trend import SMAIndicator
+
+class RSIMovingAverageEnvelopeStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        df['sma'] = SMAIndicator(df['close'], window=20).sma_indicator()
+        df['upper_env'] = df['sma'] * 1.05
+        df['lower_env'] = df['sma'] * 0.95
+        df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
+        
+        df['signal'] = 0
+        df.loc[(df['close'] > df['upper_env']) & (df['rsi'] < 50), 'signal'] = -1
+        df.loc[(df['close'] < df['lower_env']) & (df['rsi'] > 50), 'signal'] = 1
+        
+        df['exit_signal'] = 0
+        df.loc[(df['signal'].shift(1) == 1) & (df['close'] >= df['sma']), 'exit_signal'] = 1
+        df.loc[(df['signal'].shift(1) == -1) & (df['close'] <= df['sma']), 'exit_signal'] = -1
+        
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\sma_crossover.py
+==============================================
+
+from ta.trend import SMAIndicator
+
+class SMACrossoverStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        df["sma_short"] = SMAIndicator(df["close"], window=10).sma_indicator()
+        df["sma_long"]  = SMAIndicator(df["close"], window=50).sma_indicator()
+
+        # Entry
+        df["signal"] = 0
+        df.loc[df["sma_short"] > df["sma_long"], "signal"] = 1
+        df.loc[df["sma_short"] < df["sma_long"], "signal"] = -1
+
+        # Exit on crossover back
+        df["exit_signal"] = 0
+        df.loc[
+            (df["signal"].shift(1) == 1) &
+            (df["sma_short"] < df["sma_long"]),
+            "exit_signal"
+        ] = 1
+        df.loc[
+            (df["signal"].shift(1) == -1) &
+            (df["sma_short"] > df["sma_long"]),
+            "exit_signal"
+        ] = -1
+
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\strategy_manager.py
+=================================================
+
+# strategies/strategy_manager.py
+
+class StrategyManager:
+    def __init__(self):
+        # map human-readable names to instantiated strategy objects
+        self.strategy_map = {
+            "EMA Crossover":              self.load_ema_crossover(),
+            "RSI Divergence":             self.load_rsi_divergence(),
+            "Bollinger Breakout":         self.load_bollinger_breakout(),
+            "MACD Crossover":             self.load_macd_crossover(),
+            "SMA Crossover":              self.load_sma_crossover(),
+            "RSI+MACD Combo":             self.load_rsi_macd_combo(),
+            "Donchian Breakout":          self.load_donchian_breakout(),
+            "BB+RSI Combo":               self.load_bb_rsi_combo(),
+            "MultiEMA Stochastic":        self.load_multi_ema_stochastic(),
+            "VWAP Reversion":             self.load_vwap_reversion(),
+            "Ichimoku Breakout":          self.load_ichimoku_breakout(),
+            "Supertrend RSI":             self.load_supertrend_rsi(),
+            "MACD Volume Surge":          self.load_macd_volume_surge(),
+            "Keltner CCI Mean Reversion": self.load_keltner_cci_mean_reversion(),
+            "Turtle Three Screen":        self.load_turtle_three_screen(),
+            "Pivot Point Breakout":       self.load_pivot_point_breakout(),
+            "ADX Bollinger Squeeze":      self.load_adx_bollinger_squeeze(),
+            "RSI MA Envelope":            self.load_rsi_ma_envelope(),
+            "Machine Learning Signal":    self.load_machine_learning_signal(),
+            "Pairs Trading":              self.load_pairs_trading(),
+        }
+
+    def get_strategy(self, name: str):
+        """
+        Return an instance of the requested strategy, or None if not found.
+        """
+        return self.strategy_map.get(name)
+
+    # ───────────── existing loaders ─────────────
+
+    def load_ema_crossover(self):
+        from strategies.ema_crossover import EMACrossoverStrategy
+        return EMACrossoverStrategy()
+
+    def load_rsi_divergence(self):
+        from strategies.rsi_divergence import RSIDivergenceStrategy
+        return RSIDivergenceStrategy()
+
+    def load_bollinger_breakout(self):
+        from strategies.bollinger_breakout import BollingerBreakoutStrategy
+        return BollingerBreakoutStrategy()
+
+    def load_macd_crossover(self):
+        from strategies.macd_crossover import MACDCrossoverStrategy
+        return MACDCrossoverStrategy()
+
+    def load_sma_crossover(self):
+        from strategies.sma_crossover import SMACrossoverStrategy
+        return SMACrossoverStrategy()
+
+    def load_rsi_macd_combo(self):
+        from strategies.rsi_macd_combo import RSIMACDComboStrategy
+        return RSIMACDComboStrategy()
+
+    def load_donchian_breakout(self):
+        from strategies.donchian_breakout import DonchianBreakoutStrategy
+        return DonchianBreakoutStrategy()
+
+    def load_bb_rsi_combo(self):
+        from strategies.bb_rsi_combo import BBRSIComboStrategy
+        return BBRSIComboStrategy()
+
+    # ───────────── new loader methods ─────────────
+
+    def load_multi_ema_stochastic(self):
+        from strategies.multi_ema_stochastic import MultiEMAStochasticStrategy
+        return MultiEMAStochasticStrategy()
+
+    def load_vwap_reversion(self):
+        from strategies.vwap_reversion import VWAPReversionStrategy
+        return VWAPReversionStrategy()
+
+    def load_ichimoku_breakout(self):
+        from strategies.ichimoku_breakout import IchimokuBreakoutStrategy
+        return IchimokuBreakoutStrategy()
+
+    def load_supertrend_rsi(self):
+        from strategies.supertrend_rsi import SupertrendRSIStrategy
+        return SupertrendRSIStrategy()
+
+    def load_macd_volume_surge(self):
+        from strategies.macd_volume_surge import MACDVolumeSurgeStrategy
+        return MACDVolumeSurgeStrategy()
+
+    def load_keltner_cci_mean_reversion(self):
+        from strategies.keltner_cci_mean_reversion import KeltnerCCIMeanReversionStrategy
+        return KeltnerCCIMeanReversionStrategy()
+
+    def load_turtle_three_screen(self):
+        from strategies.turtle_three_screen import TurtleThreeScreenStrategy
+        return TurtleThreeScreenStrategy()
+
+    def load_pivot_point_breakout(self):
+        from strategies.pivot_point_breakout import PivotPointBreakoutStrategy
+        return PivotPointBreakoutStrategy()
+
+    def load_adx_bollinger_squeeze(self):
+        from strategies.adx_bollinger_squeeze import ADXBollingerSqueezeStrategy
+        return ADXBollingerSqueezeStrategy()
+
+    def load_rsi_ma_envelope(self):
+        from strategies.rsi_ma_envelope import RSIMovingAverageEnvelopeStrategy
+        return RSIMovingAverageEnvelopeStrategy()
+
+    def load_machine_learning_signal(self):
+        from strategies.ml_signal import MachineLearningSignalStrategy
+        return MachineLearningSignalStrategy()
+
+    def load_pairs_trading(self):
+        from strategies.pairs_trading import PairsTradingStrategy
+        return PairsTradingStrategy()
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\supertrend_rsi.py
+===============================================
+
+# strategies/supertrend_rsi.py
+
+import numpy as np
+import pandas as pd
+from ta.volatility import AverageTrueRange
+from ta.momentum import RSIIndicator
+
+class SupertrendRSIStrategy:
+    def generate_signal(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        # 1) Compute ATR
+        df['atr'] = AverageTrueRange(
+            high=df['high'], low=df['low'], close=df['close'], window=10
+        ).average_true_range()
+
+        # 2) Compute basic upper/lower bands
+        hl2 = (df['high'] + df['low']) / 2
+        mult = 3.0  # same as multiplier=3 in your original code
+        basic_ub = hl2 + mult * df['atr']
+        basic_lb = hl2 - mult * df['atr']
+
+        # 3) Iterate to get final bands and Supertrend line
+        final_ub = [basic_ub.iloc[0]]
+        final_lb = [basic_lb.iloc[0]]
+        supertrend = [hl2.iloc[0]]  # dummy first value
+
+        for i in range(1, len(df)):
+            bu = basic_ub.iloc[i]
+            bl = basic_lb.iloc[i]
+            prev_fu = final_ub[-1]
+            prev_fl = final_lb[-1]
+            close_prev = df['close'].iloc[i-1]
+
+            # Final upper band
+            if (bu < prev_fu) or (close_prev > prev_fu):
+                fu = bu
+            else:
+                fu = prev_fu
+
+            # Final lower band
+            if (bl > prev_fl) or (close_prev < prev_fl):
+                fl = bl
+            else:
+                fl = prev_fl
+
+            final_ub.append(fu)
+            final_lb.append(fl)
+
+            # Supertrend = choose the band based on current close
+            if df['close'].iloc[i] <= fu:
+                supertrend.append(fu)
+            else:
+                supertrend.append(fl)
+
+        df['supertrend'] = supertrend
+
+        # 4) RSI filter
+        df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
+
+        # 5) Entry signals: price above ST & RSI < 60 → long; below ST & RSI > 40 → short
+        df['signal'] = 0
+        df.loc[(df['close'] > df['supertrend']) & (df['rsi'] < 60), 'signal'] = 1
+        df.loc[(df['close'] < df['supertrend']) & (df['rsi'] > 40), 'signal'] = -1
+
+        # 6) Exit signals: when RSI goes beyond extreme back across your thresholds
+        df['exit_signal'] = 0
+        df.loc[
+            (df['signal'].shift(1) == 1) & (df['rsi'] > 70),
+            'exit_signal'
+        ] = 1
+        df.loc[
+            (df['signal'].shift(1) == -1) & (df['rsi'] < 30),
+            'exit_signal'
+        ] = -1
+
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\turtle_three_screen.py
+====================================================
+
+# strategies/turtle_three_screen.py
+
+import pandas as pd
+from ta.volatility import DonchianChannel
+from ta.trend       import CCIIndicator
+
+class TurtleThreeScreenStrategy:
+    def generate_signal(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        # 1) Donchian Channel needs high, low AND close
+        dc = DonchianChannel(
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            window=20
+        )
+        df["dc_upper"] = dc.donchian_channel_hband()
+        df["dc_lower"] = dc.donchian_channel_lband()
+
+        # 2) CCI for momentum filter
+        df["cci"] = CCIIndicator(
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            window=20
+        ).cci()
+
+        # 3) Entry signals: breakout + extreme CCI
+        df["signal"] = 0
+        df.loc[
+            (df["close"] > df["dc_upper"]) & (df["cci"] > 100),
+            "signal"
+        ] = 1
+        df.loc[
+            (df["close"] < df["dc_lower"]) & (df["cci"] < -100),
+            "signal"
+        ] = -1
+
+        # no rule-based exits in this strat
+        df["exit_signal"] = 0
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\vwap_reversion.py
+===============================================
+
+from ta.volume import VolumeWeightedAveragePrice
+
+class VWAPReversionStrategy:
+    def generate_signal(self, df):
+        df = df.copy()
+        vwap = VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['volume'], window=14)
+        df['vwap'] = vwap.volume_weighted_average_price()
+        df['deviation'] = (df['close'] - df['vwap']).abs()
+        
+        # Entry: price deviates > 1 ATR from VWAP
+        df['atr'] = df['deviation'].rolling(14).mean()
+        df['signal'] = 0
+        df.loc[df['close'] > df['vwap'] + df['atr'], 'signal'] = -1
+        df.loc[df['close'] < df['vwap'] - df['atr'], 'signal'] = 1
+        
+        df['exit_signal'] = 0
+        df.loc[(df['signal'].shift(1) == 1) & (df['close'] >= df['vwap']), 'exit_signal'] = 1
+        df.loc[(df['signal'].shift(1) == -1) & (df['close'] <= df['vwap']), 'exit_signal'] = -1
+        
+        return df
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\strategies\__init__.py
+=========================================
+
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\utils\config.py
+==================================
+
+# utils/config.py
+
+from pydantic import BaseModel, Field
+
+class Config(BaseModel):
+    symbol:            str
+    timeframe:         str   = Field(..., pattern=r"^(5m|15m|1h|2h|4h)$")
+    limit:             int   = 500
+    poll_interval:     int   = 60
+    initial_capital:   float = 1000.0
+    leverage:          int   = 1
+    risk_per_trade:    float = 0.01
+    atr_window:        int   = 14
+    atr_multiplier:    float = 1.5
+    tp_multiplier:     float = 3.0
+    trailing_atr_multiplier: float = 1.5
+    adx_window:        int   = 14
+    adx_threshold:     float = 25.0
+    ma_period:         int   = 200
+    max_holding_bars:  int   = 48
+    taker_fee:         float = 0.0004
+    paper_mode:        bool  = True
+    trade_log_file:    str   = "data/trades.csv"
+
+
+
+# # Then in your main startup:
+# from utils.config import Config
+# cfg = Config.parse_file("config.yaml")
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\utils\helpers.py
+===================================
+
+import requests
+import os
+import yaml
+
+def send_telegram_message(msg):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": msg}
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Telegram error: {e}")
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\utils\performance_analyzer.py
+================================================
+
+# utils/performance_analyzer.py
+
+import pandas as pd
+import numpy as np
+
+class PerformanceAnalyzer:
+    def analyze_trades(self, trades_df: pd.DataFrame) -> dict:
+        # extract profit series
+        profits      = trades_df['profit'] if 'profit' in trades_df else trades_df.get('net_pnl', pd.Series(dtype=float))
+        total_trades = len(profits)
+
+        # basic stats
+        win_rate    = (profits > 0).sum() / total_trades * 100 if total_trades > 0 else 0.0
+        avg_profit  = profits.mean()    if total_trades > 0 else 0.0
+        total_return= profits.sum()
+        # cumulative PnL and drawdown
+        cum_pnl     = profits.cumsum()
+        max_dd      = (cum_pnl.expanding(min_periods=1).max() - cum_pnl).max()
+
+        # safe Sharpe
+        if total_trades < 2 or profits.std() == 0:
+            sharpe = float('nan')
+        else:
+            sharpe = profits.mean() / profits.std() * np.sqrt(252)
+
+        return {
+            "Total Trades":         total_trades,
+            "Win Rate (%)":         f"{win_rate:.2f}%",
+            "Avg Profit per Trade": f"${avg_profit:.2f}",
+            "Sharpe Ratio":         ("nan" if np.isnan(sharpe) else f"{sharpe:.2f}"),
+            "Total Return ($)":     f"${total_return:.2f}",
+            "Max Drawdown ($)":     f"${max_dd:.2f}"
+        }
+
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\utils\report_exporter.py
+===========================================
+
+import pandas as pd
+
+class ReportExporter:
+    def export_to_csv(self, trades_df, filename="data/backtest_report.csv"):
+        trades_df.to_csv(filename, index=False)
+--------------------------------------------------------------------------------
+
+File: C:\bot\U2\u2\utils\retry.py
+=================================
+
+import time, functools
+
+def retry(exceptions, tries=3, delay=1, backoff=2):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            mdelay = delay
+            for attempt in range(tries):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as e:
+                    if attempt == tries - 1:
+                        raise
+                    time.sleep(mdelay)
+                    mdelay *= backoff
+        return wrapper
+    return decorator
+
+--------------------------------------------------------------------------------
+

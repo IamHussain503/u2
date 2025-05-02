@@ -8,8 +8,8 @@ class RiskManager:
         balance: float,
         price: float,
         stop_loss: float,
-        leverage: int = 1,
-        risk_percent: float = 0.01
+        leverage: int = 10,
+        risk_percent: float = 100
     ) -> float:
         """
         balance         : account equity in quote currency (e.g. USDT)

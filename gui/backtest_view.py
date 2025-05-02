@@ -3,6 +3,7 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QTextEdit, QLabel, QComboBox
 from exchange.binance_connector import BinanceFuturesConnector
 from strategies.strategy_manager import StrategyManager
+from utils.report_exporter import ReportExporter
 from backtester.backtester import Backtester
 from utils.performance_analyzer import PerformanceAnalyzer
 import threading
@@ -60,7 +61,7 @@ class BacktestView(QWidget):
         try:
             # 1) fetch data (spot or futures as you prefer)
             conn = BinanceFuturesConnector()
-            df   = conn.fetch_ohlcv(symbol="TAO/USDT", timeframe="4h", limit=200)
+            df   = conn.fetch_ohlcv(symbol="TAO/USDT", timeframe="4h", limit=100)
             df.columns = ["timestamp","open","high","low","close","volume"]  # ensure names
 
             # 2) pick strategy
@@ -71,6 +72,8 @@ class BacktestView(QWidget):
             # 3) backtest
             backtester = Backtester()
             trades_df, final_cap = backtester.run_backtest(df, strat)
+            ReportExporter().export_to_csv(trades_df, filename="data/backtest_trades.csv")
+
 
             # 4) display
             if trades_df.empty:

@@ -5,6 +5,8 @@ import yaml
 import pandas as pd
 import ta
 import ccxt
+import pandas as pd
+from datetime import datetime, timezone, timedelta
 
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QComboBox
 from PyQt6.QtCore    import pyqtSignal
@@ -125,8 +127,12 @@ class Dashboard(QWidget):
             print(msg)
 
 
+
     def log(self, msg: str):
-        self.log_signal.emit(msg)
+        tz5 = timezone(timedelta(hours=5))
+        ts = datetime.now(tz5).strftime("%Y-%m-%d %H:%M:%S")
+        self.log_signal.emit(f"[{ts}] {msg}")
+
 
 
     @retry((ccxt.NetworkError, ccxt.ExchangeError, ConnectionError), tries=5, delay=1, backoff=2)
@@ -281,8 +287,10 @@ class Dashboard(QWidget):
         self.sl_price       = price - (atr * self.sl_atr_mult)
         self.tp_price       = price + (atr * self.tp_atr_mult)
         self.highest_price  = price
-        self.entry_bar_idx  = current_idx
+        self.entry_bar_idx  = current_idx        # record entry timestamp in UTC+5
+        self.entry_time = pd.Timestamp.now(tz="Asia/Karachi")
         self.trailing_dist  = atr * self.trailing_atr_multiplier
+
 
         self.log(f"[LONG] Open @ {price:.5f} | SL={self.sl_price:.5f} TP={self.tp_price:.5f} TrailDist={self.trailing_dist:.5f}")
 
@@ -304,6 +312,9 @@ class Dashboard(QWidget):
         self.lowest_price   = price
         self.entry_bar_idx  = current_idx
         self.trailing_dist  = atr * self.trailing_atr_multiplier
+        # record entry timestamp in UTC+5
+        self.entry_time = pd.Timestamp.now(tz="Asia/Karachi")
+
 
         self.log(f"[SHORT] Open @ {price:.5f} | SL={self.sl_price:.5f} TP={self.tp_price:.5f} TrailDist={self.trailing_dist:.5f}")
 
@@ -354,7 +365,8 @@ class Dashboard(QWidget):
         send_telegram_message(msg)
 
         self._save_trade({
-            "timestamp":   pd.Timestamp.now(),
+            "entry_time":  self.entry_time,
+            "exit_time":   pd.Timestamp.now(tz="Asia/Karachi"),
             "type":        self.position_type,
             "entry_price": self.entry_price,
             "exit_price":  exit_price,
